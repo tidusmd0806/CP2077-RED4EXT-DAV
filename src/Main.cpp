@@ -349,15 +349,25 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
     {
     case RED4ext::EMainReason::Load:
     {
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterSetVehicle);
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterHasGravity);
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterEnableGravity);
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterAddLinelyVelocity);
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterChangeLinelyVelocity);
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetVelocity);
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetAngularVelocity);
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetPhysicsState);
-        RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterIsOnGround);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterSetVehicle);
+        RED4ext::CRTTISystem::Get()->AddRegisterCallback(RegisterFlyAVSystem);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetVehicle);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterHasGravity);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterEnableGravity);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterAddLinelyVelocity);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterChangeLinelyVelocity);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetVelocity);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetAngularVelocity);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetPhysicsState);
+        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterIsOnGround);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterHasGravity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterEnableGravity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterAddLinelyVelocity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterChangeLinelyVelocity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetVelocity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetAngularVelocity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetPhysicsState);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterIsOnGround);
         break;
     }
     case RED4ext::EMainReason::Unload:

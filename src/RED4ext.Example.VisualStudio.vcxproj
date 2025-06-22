@@ -16,6 +16,7 @@
     <ProjectGuid>{8a72e3b4-b773-416f-aa0c-fcbee424af09}</ProjectGuid>
     <RootNamespace>RED4extExampleVisualStudio</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>RED4ext_DAV</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
