@@ -1,0 +1,3 @@
+[submodule "deps/red4ext.sdk"]
+	path = deps/red4ext.sdk
+	url = https://github.com/jackhumbert/RED4ext.SDK
