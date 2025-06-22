@@ -48,11 +48,13 @@
     <LinkIncremental>true</LinkIncremental>
     <OutDir>$(SolutionDir)\build\debug\bin\</OutDir>
     <IncludePath>../deps/red4ext.sdk/include;$(IncludePath)</IncludePath>
+    <TargetName>DriveAerialVehicle</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
     <OutDir>$(SolutionDir)\build\release\bin\</OutDir>
     <IncludePath>../deps/red4ext.sdk/include;$(IncludePath)</IncludePath>
+    <TargetName>DriveAerialVehicle</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
