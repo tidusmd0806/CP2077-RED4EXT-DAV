@@ -1,17 +1,28 @@
+// fix to compile error in physicsProxyManager-inl.hpp
+#define physics_proxyManager_Addr 0
+
 #include <RED4ext/RED4ext.hpp>
 #include <RED4ext/RTTITypes.hpp>
 #include <RED4ext/Scripting/Natives/vehicleBaseObject.hpp>
 #include <RED4ext/Scripting/Natives/vehiclePhysicsData.hpp>
 #include <RED4ext/Definitions.hpp>
 
+#ifdef FLY_TANK_MOD
+struct FlyTankSystem : RED4ext::IScriptable
+#else
 struct FlyAVSystem : RED4ext::IScriptable
+#endif
 {
     RED4ext::CClass* GetNativeType();
 };
 
+#ifdef FLY_TANK_MOD
+RED4ext::TTypedClass<FlyTankSystem> cls("FlyTankSystem");
+RED4ext::CClass* FlyTankSystem::GetNativeType()
+#else
 RED4ext::TTypedClass<FlyAVSystem> cls("FlyAVSystem");
-
 RED4ext::CClass* FlyAVSystem::GetNativeType()
+#endif
 {
     return &cls;
 }
@@ -240,9 +251,15 @@ void IsOnGround(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, bo
     }
 }
 
+#ifdef FLY_TANK_MOD
+RED4EXT_C_EXPORT void RED4EXT_CALL RegisterFlyTankSystem()
+{
+    RED4ext::CNamePool::Add("FlyTankSystem");
+#else
 RED4EXT_C_EXPORT void RED4EXT_CALL RegisterFlyAVSystem()
 {
     RED4ext::CNamePool::Add("FlyAVSystem");
+#endif
 
     cls.flags = {.isNative = true};
     RED4ext::CRTTISystem::Get()->RegisterType(&cls);
@@ -414,17 +431,12 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
     {
     case RED4ext::EMainReason::Load:
     {
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterSetVehicle);
+#ifdef FLY_TANK_MOD
+        RED4ext::CRTTISystem::Get()->AddRegisterCallback(RegisterFlyTankSystem);
+#else
         RED4ext::CRTTISystem::Get()->AddRegisterCallback(RegisterFlyAVSystem);
+#endif
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetVehicle);
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterHasGravity);
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterEnableGravity);
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterAddLinelyVelocity);
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterChangeLinelyVelocity);
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetVelocity);
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetAngularVelocity);
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterGetPhysicsState);
-        //RED4ext::RTTIRegistrator::Add(RegisterFlyAVSystem, PostRegisterIsOnGround);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterHasGravity);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterEnableGravity);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterAddLinelyVelocity);
