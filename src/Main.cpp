@@ -460,11 +460,19 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
 
 RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::PluginInfo* aInfo)
 {
-    aInfo->name = L"DAV API";
+#ifdef FLY_TANK_MOD
+    aInfo->name = L"Fly Tank API";
     aInfo->author = L"tidus";
-    aInfo->version = RED4EXT_SEMVER(2, 6, 0);
+    aInfo->version = RED4EXT_SEMVER(1, 1, 3);
     aInfo->runtime = RED4EXT_RUNTIME_INDEPENDENT;
     aInfo->sdk = RED4EXT_SDK_LATEST;
+#else
+    aInfo->name = L"DAV API";
+    aInfo->author = L"tidus";
+    aInfo->version = RED4EXT_SEMVER(3, 0, 0);
+    aInfo->runtime = RED4EXT_RUNTIME_INDEPENDENT;
+    aInfo->sdk = RED4EXT_SDK_LATEST;
+#endif
 }
 
 RED4EXT_C_EXPORT uint32_t RED4EXT_CALL Supports()
