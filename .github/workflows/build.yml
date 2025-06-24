@@ -8,7 +8,7 @@ jobs:
 
     strategy:
       matrix:
-        config: [ Debug, Release ]
+        config: [ Release, Release_FlyTank ]
 
     steps:
       - name: Checkout
@@ -20,4 +20,4 @@ jobs:
         uses: microsoft/setup-msbuild@v1.0.2
 
       - name: Build
-        run: MSBuild.exe RED4ext.Example.VisualStudio.sln -v:minimal -m -property:Configuration=${{ matrix.config }}
+        run: MSBuild.exe RED4ext_DAV.sln -v:minimal -m -property:Configuration=${{ matrix.config }}
