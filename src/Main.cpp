@@ -89,7 +89,7 @@ void EnableGravity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame,
     }
 }
 
-void AddLinelyVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+void AddVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
     RED4EXT_UNUSED_PARAMETER(a4);
@@ -133,7 +133,7 @@ void AddForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, floa
     }
 }
 
-void ChangeLinelyVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+void ChangeVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
     RED4EXT_UNUSED_PARAMETER(a4);
@@ -164,6 +164,37 @@ void ChangeLinelyVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* 
         {
             vehicle->physicsData->velocity = velocity;
             vehicle->physicsData->angularVelocity = angularVelocity;
+        }
+        *aOut = 1;
+    }
+}
+
+void ChangeForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    RED4ext::Vector3 force;
+    RED4ext::Vector3 torque;
+    float switchIndex;
+    RED4ext::GetParameter(aFrame, &force);
+    RED4ext::GetParameter(aFrame, &torque);
+    RED4ext::GetParameter(aFrame, &switchIndex);
+    aFrame->code++; // skip ParamEnd
+    *aOut = 0;
+    if (vehicle)
+    {
+        if (switchIndex == 1)
+        {
+            vehicle->physicsData->force = force;
+        }
+        else if (switchIndex == 2)
+        {
+            vehicle->physicsData->torque = torque;
+        }
+        else
+        {
+            vehicle->physicsData->force = force;
+            vehicle->physicsData->torque = torque;
         }
         *aOut = 1;
     }
@@ -205,6 +236,40 @@ void GetAngularVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aF
     if (vehicle)
     {
         *aOut = vehicle->physicsData->angularVelocity;
+    }
+}
+
+void GetForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Vector3* aOut,
+                        int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(aFrame);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    RED4ext::Vector3 force;
+    force.X = 0;
+    force.Y = 0;
+    force.Z = 0;
+    *aOut = force;
+    if (vehicle)
+    {
+        *aOut = vehicle->physicsData->force;
+    }
+}
+
+void GetTorque(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Vector3* aOut,
+                        int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(aFrame);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    RED4ext::Vector3 torque;
+    torque.X = 0;
+    torque.Y = 0;
+    torque.Z = 0;
+    *aOut = torque;
+    if (vehicle)
+    {
+        *aOut = vehicle->physicsData->torque;
     }
 }
 
@@ -307,14 +372,14 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterEnableGravity()
     cls.RegisterFunction(func);
 }
 
-RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterAddLinelyVelocity()
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterAddVelocity()
 {
     auto rtti = RED4ext::CRTTISystem::Get();
     auto scriptable = rtti->GetClass("IScriptable");
     cls.parent = scriptable;
 
     RED4ext::CBaseFunction::Flags flags = {.isNative = true};
-    auto func = RED4ext::CClassFunction::Create(&cls, "AddLinelyVelocity", "AddLinelyVelocity", &AddLinelyVelocity,
+    auto func = RED4ext::CClassFunction::Create(&cls, "AddVelocity", "AddVelocity", &AddVelocity,
                                                 {.isNative = true});
     func->flags = flags;
     func->SetReturnType("Float");
@@ -337,19 +402,34 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterAddForce()
     cls.RegisterFunction(func);
 }
 
-RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterChangeLinelyVelocity()
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterChangeVelocity()
 {
     auto rtti = RED4ext::CRTTISystem::Get();
     auto scriptable = rtti->GetClass("IScriptable");
     cls.parent = scriptable;
 
     RED4ext::CBaseFunction::Flags flags = {.isNative = true};
-    auto func = RED4ext::CClassFunction::Create(&cls, "ChangeLinelyVelocity", "ChangeLinelyVelocity",
-                                                &ChangeLinelyVelocity, {.isNative = true});
+    auto func = RED4ext::CClassFunction::Create(&cls, "ChangeVelocity", "ChangeVelocity",
+                                                &ChangeVelocity, {.isNative = true});
     func->flags = flags;
     func->SetReturnType("Float");
     func->AddParam("Vector3", "velocity");
     func->AddParam("Vector3", "angularVelocity");
+    func->AddParam("Float", "switchIndex");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterChangeForce()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+    RED4ext::CBaseFunction::Flags flags = {.isNative = true};
+    auto func = RED4ext::CClassFunction::Create(&cls, "ChangeForce", "ChangeForce", &ChangeForce, {.isNative = true});
+    func->flags = flags;
+    func->SetReturnType("Float");
+    func->AddParam("Vector3", "force");
+    func->AddParam("Vector3", "torque");
     func->AddParam("Float", "switchIndex");
     cls.RegisterFunction(func);
 }
@@ -376,6 +456,30 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetAngularVelocity()
     RED4ext::CBaseFunction::Flags flags = {.isNative = true};
     auto func = RED4ext::CClassFunction::Create(&cls, "GetAngularVelocity", "GetAngularVelocity", &GetAngularVelocity,
                                                 {.isNative = true});
+    func->flags = flags;
+    func->SetReturnType("Vector3");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetForce()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+    RED4ext::CBaseFunction::Flags flags = {.isNative = true};
+    auto func = RED4ext::CClassFunction::Create(&cls, "GetForce", "GetForce", &GetForce, {.isNative = true});
+    func->flags = flags;
+    func->SetReturnType("Vector3");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetTorque()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+    RED4ext::CBaseFunction::Flags flags = {.isNative = true};
+    auto func = RED4ext::CClassFunction::Create(&cls, "GetTorque", "GetTorque", &GetTorque, {.isNative = true});
     func->flags = flags;
     func->SetReturnType("Vector3");
     cls.RegisterFunction(func);
@@ -439,11 +543,14 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetVehicle);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterHasGravity);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterEnableGravity);
-        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterAddLinelyVelocity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterAddVelocity);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterAddForce);
-        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterChangeLinelyVelocity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterChangeVelocity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterChangeForce);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetVelocity);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetAngularVelocity);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetForce);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetTorque);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetPhysicsState);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterUnsetPhysicsState);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterIsOnGround);
@@ -463,7 +570,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::PluginInfo* aInfo)
 #ifdef FLY_TANK_MOD
     aInfo->name = L"Fly Tank API";
     aInfo->author = L"tidus";
-    aInfo->version = RED4EXT_SEMVER(1, 1, 3);
+    aInfo->version = RED4EXT_SEMVER(1, 2, 0);
     aInfo->runtime = RED4EXT_RUNTIME_INDEPENDENT;
     aInfo->sdk = RED4EXT_SDK_LATEST;
 #else
