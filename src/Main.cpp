@@ -56,7 +56,7 @@ void SetVehicle(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, fl
     }
 }
 
-void GetInverseMass(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+void GetMass(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
     RED4EXT_UNUSED_PARAMETER(aFrame);
@@ -66,7 +66,7 @@ void GetInverseMass(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame
 
     if (vehicle && vehicle->physicsData)
     {
-        *aOut = vehicle->physicsData->inverseMass;
+        *aOut = vehicle->physicsData->total_mass;
     }
 }
 
@@ -358,14 +358,14 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetVehicle()
     cls.RegisterFunction(func);
 }
 
-RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetInverseMass()
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetMass()
 {
     auto rtti = RED4ext::CRTTISystem::Get();
     auto scriptable = rtti->GetClass("IScriptable");
     cls.parent = scriptable;
     RED4ext::CBaseFunction::Flags flags = {.isNative = true};
     auto func =
-        RED4ext::CClassFunction::Create(&cls, "GetInverseMass", "GetInverseMass", &GetInverseMass, {.isNative = true});
+        RED4ext::CClassFunction::Create(&cls, "GetMass", "GetMass", &GetMass, {.isNative = true});
     func->flags = flags;
     func->SetReturnType("Float");
     cls.RegisterFunction(func);
@@ -568,7 +568,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddRegisterCallback(RegisterFlyAVSystem);
 #endif
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetVehicle);
-        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetInverseMass);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetMass);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterHasGravity);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterEnableGravity);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterAddVelocity);
