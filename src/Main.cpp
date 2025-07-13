@@ -1,11 +1,7 @@
-// fix to compile error in physicsProxyManager-inl.hpp
-#define physics_proxyManager_Addr 0
-
 #include <RED4ext/RED4ext.hpp>
 #include <RED4ext/RTTITypes.hpp>
 #include <RED4ext/Scripting/Natives/vehicleBaseObject.hpp>
 #include <RED4ext/Scripting/Natives/vehiclePhysicsData.hpp>
-#include <RED4ext/Definitions.hpp>
 
 #ifdef FLY_TANK_MOD
 struct FlyTankSystem : RED4ext::IScriptable
@@ -311,7 +307,7 @@ void UnsetPhysicsState(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFr
 
     if (vehicle)
     {
-        vehicle->UnsetPhysicsStates();
+        vehicle->ForceEnablePhysics();
         *aOut = 1;
     }
 }
