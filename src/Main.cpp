@@ -2,6 +2,156 @@
 #include <RED4ext/RTTITypes.hpp>
 #include <RED4ext/Scripting/Natives/vehicleBaseObject.hpp>
 #include <RED4ext/Scripting/Natives/vehiclePhysicsData.hpp>
+#include <RED4ext/Scripting/Natives/vehiclePhysics.hpp>
+
+static bool is_enable_original_physics = true;
+
+//////////////////////////////////////////////////////////////////////
+// In this area, class names and macro names have been changed based on Jackhambert's code.
+// https://github.com/jackhumbert/let_there_be_flight/blob/main/src/red4ext/Utils/FlightModule.hpp
+////////
+
+struct DAVModule
+{
+    virtual void Load(const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle) {};
+    virtual void RegisterTypes() {};
+    virtual void PostRegisterTypes() {};
+    virtual void Unload(const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle) {};
+};
+class IDAVModuleHook : DAVModule
+{
+public:
+    std::string m_name;
+    uintptr_t m_address;
+    void* m_hook;
+    void** m_original;
+
+    virtual void Load(const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle) override
+    {
+        while (!aSdk->hooking->Attach(aHandle, RED4EXT_OFFSET_TO_ADDR(this->m_address), this->m_hook, this->m_original))
+        {
+            aSdk->logger->Trace(aHandle, "try to hooking again");
+        }
+    };
+
+    virtual void Unload(const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle) override
+    {
+        aSdk->hooking->Detach(aHandle, RED4EXT_OFFSET_TO_ADDR(this->m_address));
+    };
+};
+class DAVModuleFactory
+{
+    std::vector<std::function<void(const RED4ext::Sdk*, RED4ext::PluginHandle)>> s_loads;
+    std::vector<std::function<void(const RED4ext::Sdk*, RED4ext::PluginHandle)>> s_unloads;
+    std::vector<std::function<void()>> s_registers;
+    std::vector<std::function<void()>> s_postRegisters;
+    std::vector<IDAVModuleHook*> s_hooks;
+
+public:
+    static DAVModuleFactory& GetInstance()
+    {
+        static DAVModuleFactory s_instance;
+        return s_instance;
+    }
+    template<class T>
+    void registerClass(const std::string& name)
+    {
+        s_loads.emplace_back([](const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle) -> void
+                             { (new T())->Load(aSdk, aHandle); });
+        s_unloads.emplace_back([](const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle) -> void
+                               { (new T())->Unload(aSdk, aHandle); });
+        s_registers.emplace_back([]() -> void { (new T())->RegisterTypes(); });
+        s_postRegisters.emplace_back([]() -> void { (new T())->PostRegisterTypes(); });
+    }
+    void registerHook(IDAVModuleHook* moduleHook)
+    {
+        s_hooks.emplace_back(moduleHook);
+    }
+    void Load(const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle)
+    {
+        for (const auto& load : s_loads)
+        {
+            load(aSdk, aHandle);
+        }
+        for (const auto& hook : s_hooks)
+        {
+            hook->Load(aSdk, aHandle);
+        }
+    }
+    void Unload(const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle)
+    {
+        for (const auto& hook : s_hooks)
+        {
+            hook->Unload(aSdk, aHandle);
+        }
+        for (const auto& unload : s_unloads)
+        {
+            unload(aSdk, aHandle);
+        }
+    }
+    void RegisterTypes()
+    {
+        for (const auto& s_register : s_registers)
+        {
+            s_register();
+        }
+    }
+    void PostRegisterTypes()
+    {
+        for (const auto& postRegister : s_postRegisters)
+        {
+            postRegister();
+        }
+    }
+};
+class DAVModuleHookHash : IDAVModuleHook
+{
+public:
+    explicit DAVModuleHookHash(std::string name, uint32_t hash, void* hook, void** original)
+    {
+        this->m_name = name;
+        this->m_address =
+            RED4ext::UniversalRelocBase::Resolve(hash) - reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
+        this->m_hook = hook;
+        this->m_original = original;
+        DAVModuleFactory::GetInstance().registerHook(this);
+    }
+};
+
+#define REGISTER_DAV_HOOK_HASH_(retType, hash, func, ...)                                                            \
+    retType func(__VA_ARGS__);                                                                                         \
+    decltype(&func) func##_Original;                                                                                   \
+    DAVModuleHookHash s_##func##_Hook(#func, hash, reinterpret_cast<void*>(&func),                                  \
+                                         reinterpret_cast<void**>(&func##_Original));                                  \
+    retType func(__VA_ARGS__)
+
+REGISTER_DAV_HOOK_HASH_(void __fastcall, 3303544265, vehiclePhysicsData_ApplyTorqueAtPosition,
+                          RED4ext::vehicle::PhysicsData* physicsData, RED4ext::Vector3* offset,
+                          RED4ext::Vector3* torque)
+{
+    if (is_enable_original_physics)
+    {
+        vehiclePhysicsData_ApplyTorqueAtPosition_Original(physicsData, offset, torque);
+    }
+    else
+    {
+        return;
+    }
+}
+
+REGISTER_DAV_HOOK_HASH_(void __fastcall, 611586815, ApplyForceAtPosition, RED4ext::vehicle::PhysicsData* physicsData,
+                          RED4ext::Vector3* offset, RED4ext::Vector3* force)
+{
+    if (is_enable_original_physics)
+    {
+        ApplyForceAtPosition_Original(physicsData, offset, force);
+    }
+    else
+    {
+        return;
+    }
+}
+//////////////////////////////////////////////////////////////////////////////////
 
 #ifdef FLY_TANK_MOD
 struct FlyTankSystem : RED4ext::IScriptable
@@ -43,11 +193,28 @@ void SetVehicle(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, fl
     RED4ext::ExecuteFunction("ScriptGameInstance", "FindEntityByID", &wvehicle, gameInstance, entity_id);
 
     vehicle = wvehicle.Lock();
+    is_enable_original_physics = true;
 
     *aOut = 0;
 
     if (vehicle)
     {
+        *aOut = 1;
+    }
+}
+
+void EnableOriginalPhysics(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(aFrame);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    bool is_enable;
+    RED4ext::GetParameter(aFrame, &is_enable);
+    aFrame->code++; // skip ParamEnd
+    *aOut = 0;
+    if (vehicle)
+    {
+        is_enable_original_physics = is_enable;
         *aOut = 1;
     }
 }
@@ -60,7 +227,7 @@ void GetMass(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float
 
     *aOut = 0;
 
-    if (vehicle && vehicle->physicsData)
+    if (vehicle)
     {
         *aOut = vehicle->physicsData->total_mass;
     }
@@ -338,6 +505,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL RegisterFlyAVSystem()
 
     cls.flags = {.isNative = true};
     RED4ext::CRTTISystem::Get()->RegisterType(&cls);
+    DAVModuleFactory::GetInstance().RegisterTypes();
 }
 
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetVehicle()
@@ -351,6 +519,20 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetVehicle()
     func->flags = flags;
     func->SetReturnType("Float");
     func->AddParam("Uint32", "entity_id_hash");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterEnableOriginalPhysics()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+    RED4ext::CBaseFunction::Flags flags = {.isNative = true};
+    auto func = RED4ext::CClassFunction::Create(&cls, "EnableOriginalPhysics", "EnableOriginalPhysics",
+                                                &EnableOriginalPhysics, {.isNative = true});
+    func->flags = flags;
+    func->SetReturnType("Float");
+    func->AddParam("Bool", "is_enable");
     cls.RegisterFunction(func);
 }
 
@@ -548,11 +730,16 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterIsOnGround()
     cls.RegisterFunction(func);
 }
 
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterDAVHock()
+{
+    DAVModuleFactory::GetInstance().PostRegisterTypes();
+}
+
 RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::EMainReason aReason,
                                         const RED4ext::Sdk* aSdk)
 {
-    RED4EXT_UNUSED_PARAMETER(aHandle);
-    RED4EXT_UNUSED_PARAMETER(aSdk);
+    //RED4EXT_UNUSED_PARAMETER(aHandle);
+    //RED4EXT_UNUSED_PARAMETER(aSdk);
 
     switch (aReason)
     {
@@ -564,6 +751,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddRegisterCallback(RegisterFlyAVSystem);
 #endif
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetVehicle);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterEnableOriginalPhysics);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetMass);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterHasGravity);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterEnableGravity);
@@ -578,10 +766,13 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetPhysicsState);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterUnsetPhysicsState);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterIsOnGround);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterDAVHock);
+        DAVModuleFactory::GetInstance().Load(aSdk, aHandle);
         break;
     }
     case RED4ext::EMainReason::Unload:
     {
+        DAVModuleFactory::GetInstance().Unload(aSdk, aHandle);
         break;
     }
     }
