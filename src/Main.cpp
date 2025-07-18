@@ -118,14 +118,14 @@ public:
     }
 };
 
-#define REGISTER_DAV_HOOK_HASH_(retType, hash, func, ...)                                                            \
+#define REGISTER_DAV_HOOK_HASH(retType, hash, func, ...)                                                            \
     retType func(__VA_ARGS__);                                                                                         \
     decltype(&func) func##_Original;                                                                                   \
     DAVModuleHookHash s_##func##_Hook(#func, hash, reinterpret_cast<void*>(&func),                                  \
                                          reinterpret_cast<void**>(&func##_Original));                                  \
     retType func(__VA_ARGS__)
 
-REGISTER_DAV_HOOK_HASH_(void __fastcall, 3303544265, vehiclePhysicsData_ApplyTorqueAtPosition,
+REGISTER_DAV_HOOK_HASH(void __fastcall, 3303544265, vehiclePhysicsData_ApplyTorqueAtPosition,
                           RED4ext::vehicle::PhysicsData* physicsData, RED4ext::Vector3* offset,
                           RED4ext::Vector3* torque)
 {
@@ -139,7 +139,7 @@ REGISTER_DAV_HOOK_HASH_(void __fastcall, 3303544265, vehiclePhysicsData_ApplyTor
     }
 }
 
-REGISTER_DAV_HOOK_HASH_(void __fastcall, 611586815, ApplyForceAtPosition, RED4ext::vehicle::PhysicsData* physicsData,
+REGISTER_DAV_HOOK_HASH(void __fastcall, 611586815, ApplyForceAtPosition, RED4ext::vehicle::PhysicsData* physicsData,
                           RED4ext::Vector3* offset, RED4ext::Vector3* force)
 {
     if (is_enable_original_physics)
