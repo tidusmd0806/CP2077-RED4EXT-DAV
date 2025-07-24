@@ -11,14 +11,22 @@ static bool is_enable_original_physics = true;
 // https://github.com/jackhumbert/let_there_be_flight/blob/main/src/red4ext/Utils/FlightModule.hpp
 ////////
 
+#ifdef FLY_TANK_MOD
+struct FlyTankModule
+#else
 struct DAVModule
+#endif
 {
     virtual void Load(const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle) {};
     virtual void RegisterTypes() {};
     virtual void PostRegisterTypes() {};
     virtual void Unload(const RED4ext::Sdk* aSdk, RED4ext::PluginHandle aHandle) {};
 };
+#ifdef FLY_TANK_MOD
+class IFlyTankModuleHook : FlyTankModule
+#else
 class IDAVModuleHook : DAVModule
+#endif
 {
 public:
     std::string m_name;
@@ -39,18 +47,29 @@ public:
         aSdk->hooking->Detach(aHandle, RED4EXT_OFFSET_TO_ADDR(this->m_address));
     };
 };
+#ifdef FLY_TANK_MOD
+class FlyTankModuleFactory
+#else
 class DAVModuleFactory
+#endif
 {
     std::vector<std::function<void(const RED4ext::Sdk*, RED4ext::PluginHandle)>> s_loads;
     std::vector<std::function<void(const RED4ext::Sdk*, RED4ext::PluginHandle)>> s_unloads;
     std::vector<std::function<void()>> s_registers;
     std::vector<std::function<void()>> s_postRegisters;
+#ifdef FLY_TANK_MOD
+    std::vector<IFlyTankModuleHook*> s_hooks;
+public:
+    static FlyTankModuleFactory& GetInstance()
+    {
+        static FlyTankModuleFactory s_instance;
+#else
     std::vector<IDAVModuleHook*> s_hooks;
-
 public:
     static DAVModuleFactory& GetInstance()
     {
         static DAVModuleFactory s_instance;
+#endif
         return s_instance;
     }
     template<class T>
@@ -63,7 +82,11 @@ public:
         s_registers.emplace_back([]() -> void { (new T())->RegisterTypes(); });
         s_postRegisters.emplace_back([]() -> void { (new T())->PostRegisterTypes(); });
     }
+#ifdef FLY_TANK_MOD
+    void registerHook(IFlyTankModuleHook* moduleHook)
+#else
     void registerHook(IDAVModuleHook* moduleHook)
+#endif
     {
         s_hooks.emplace_back(moduleHook);
     }
@@ -104,6 +127,21 @@ public:
         }
     }
 };
+#ifdef FLY_TANK_MOD
+class FlyTankModuleHookHash : IFlyTankModuleHook
+{
+public:
+    explicit FlyTankModuleHookHash(std::string name, uint32_t hash, void* hook, void** original)
+    {
+        this->m_name = name;
+        this->m_address =
+            RED4ext::UniversalRelocBase::Resolve(hash) - reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
+        this->m_hook = hook;
+        this->m_original = original;
+        FlyTankModuleFactory::GetInstance().registerHook(this);
+    }
+};
+#else
 class DAVModuleHookHash : IDAVModuleHook
 {
 public:
@@ -117,13 +155,23 @@ public:
         DAVModuleFactory::GetInstance().registerHook(this);
     }
 };
+#endif
 
-#define REGISTER_DAV_HOOK_HASH(retType, hash, func, ...)                                                            \
-    retType func(__VA_ARGS__);                                                                                         \
-    decltype(&func) func##_Original;                                                                                   \
-    DAVModuleHookHash s_##func##_Hook(#func, hash, reinterpret_cast<void*>(&func),                                  \
-                                         reinterpret_cast<void**>(&func##_Original));                                  \
+#ifdef FLY_TANK_MOD
+#define REGISTER_DAV_HOOK_HASH(retType, hash, func, ...) \
+    retType func(__VA_ARGS__); \
+    decltype(&func) func##_Original; \
+    FlyTankModuleHookHash s_##func##_Hook(#func, hash, reinterpret_cast<void*>(&func), \
+                                         reinterpret_cast<void**>(&func##_Original)); \
     retType func(__VA_ARGS__)
+#else
+#define REGISTER_DAV_HOOK_HASH(retType, hash, func, ...) \
+    retType func(__VA_ARGS__); \
+    decltype(&func) func##_Original; \
+    DAVModuleHookHash s_##func##_Hook(#func, hash, reinterpret_cast<void*>(&func), \
+                                      reinterpret_cast<void**>(&func##_Original)); \
+    retType func(__VA_ARGS__)
+#endif
 
 REGISTER_DAV_HOOK_HASH(void __fastcall, 3303544265, vehiclePhysicsData_ApplyTorqueAtPosition,
                           RED4ext::vehicle::PhysicsData* physicsData, RED4ext::Vector3* offset,
@@ -505,7 +553,11 @@ RED4EXT_C_EXPORT void RED4EXT_CALL RegisterFlyAVSystem()
 
     cls.flags = {.isNative = true};
     RED4ext::CRTTISystem::Get()->RegisterType(&cls);
+#ifdef FLY_TANK_MOD
+    FlyTankModuleFactory::GetInstance().RegisterTypes();
+#else
     DAVModuleFactory::GetInstance().RegisterTypes();
+#endif
 }
 
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetVehicle()
@@ -732,7 +784,11 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterIsOnGround()
 
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterDAVHock()
 {
+#ifdef FLY_TANK_MOD
+    FlyTankModuleFactory::GetInstance().PostRegisterTypes();
+#else
     DAVModuleFactory::GetInstance().PostRegisterTypes();
+#endif
 }
 
 RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::EMainReason aReason,
@@ -767,12 +823,20 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterUnsetPhysicsState);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterIsOnGround);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterDAVHock);
+#ifdef FLY_TANK_MOD
+        FlyTankModuleFactory::GetInstance().Load(aSdk, aHandle);
+#else
         DAVModuleFactory::GetInstance().Load(aSdk, aHandle);
+#endif
         break;
     }
     case RED4ext::EMainReason::Unload:
     {
+#ifdef FLY_TANK_MOD
+        FlyTankModuleFactory::GetInstance().Unload(aSdk, aHandle);
+#else
         DAVModuleFactory::GetInstance().Unload(aSdk, aHandle);
+#endif
         break;
     }
     }
