@@ -5,6 +5,8 @@
 #include <RED4ext/Scripting/Natives/vehiclePhysics.hpp>
 
 static bool is_enable_original_physics = true;
+static RED4ext::Handle<RED4ext::vehicle::BaseObject> g_fly_vehicle;
+static uint64_t g_fly_vehicle_entity_id_hash = 0;
 
 //////////////////////////////////////////////////////////////////////
 // In this area, class names and macro names have been changed based on Jackhambert's code.
@@ -177,7 +179,10 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 3303544265, vehiclePhysicsData_ApplyTorq
                           RED4ext::vehicle::PhysicsData* physicsData, RED4ext::Vector3* offset,
                           RED4ext::Vector3* torque)
 {
-    if (is_enable_original_physics)
+    uint64_t veh_hash;    
+    veh_hash = physicsData->vehicle->entityID.hash;
+    
+    if (is_enable_original_physics || (veh_hash != g_fly_vehicle_entity_id_hash))
     {
         vehiclePhysicsData_ApplyTorqueAtPosition_Original(physicsData, offset, torque);
     }
@@ -190,7 +195,10 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 3303544265, vehiclePhysicsData_ApplyTorq
 REGISTER_DAV_HOOK_HASH(void __fastcall, 611586815, ApplyForceAtPosition, RED4ext::vehicle::PhysicsData* physicsData,
                           RED4ext::Vector3* offset, RED4ext::Vector3* force)
 {
-    if (is_enable_original_physics)
+    uint64_t veh_hash;
+    veh_hash = physicsData->vehicle->entityID.hash;
+
+    if (is_enable_original_physics || (veh_hash != g_fly_vehicle_entity_id_hash))
     {
         ApplyForceAtPosition_Original(physicsData, offset, force);
     }
@@ -221,31 +229,30 @@ RED4ext::CClass* FlyAVSystem::GetNativeType()
     return &cls;
 }
 
-static RED4ext::Handle<RED4ext::vehicle::BaseObject> vehicle;
-
 void SetVehicle(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
     RED4EXT_UNUSED_PARAMETER(a4);
 
     RED4ext::WeakHandle<RED4ext::vehicle::BaseObject> wvehicle;
-    uint32_t entity_id_hash;
+    uint64_t entity_id_hash;
     RED4ext::EntityID entity_id;
 
     RED4ext::GetParameter(aFrame, &entity_id_hash);
     aFrame->code++; // skip ParamEnd
 
     entity_id.hash = entity_id_hash;
+    g_fly_vehicle_entity_id_hash = entity_id_hash;
 
     RED4ext::ScriptGameInstance gameInstance;
     RED4ext::ExecuteFunction("ScriptGameInstance", "FindEntityByID", &wvehicle, gameInstance, entity_id);
 
-    vehicle = wvehicle.Lock();
+    g_fly_vehicle = wvehicle.Lock();
     is_enable_original_physics = true;
 
     *aOut = 0;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
         *aOut = 1;
     }
@@ -260,7 +267,7 @@ void EnableOriginalPhysics(RED4ext::IScriptable* aContext, RED4ext::CStackFrame*
     RED4ext::GetParameter(aFrame, &is_enable);
     aFrame->code++; // skip ParamEnd
     *aOut = 0;
-    if (vehicle)
+    if (g_fly_vehicle)
     {
         is_enable_original_physics = is_enable;
         *aOut = 1;
@@ -275,9 +282,9 @@ void GetMass(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float
 
     *aOut = 0;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        *aOut = vehicle->physicsData->total_mass;
+        *aOut = g_fly_vehicle->physicsData->total_mass;
     }
 }
 
@@ -289,9 +296,9 @@ void HasGravity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, bo
 
     *aOut = false;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        *aOut = vehicle->physicsData->unk1B0;
+        *aOut = g_fly_vehicle->physicsData->unk1B0;
     }
 }
 
@@ -307,9 +314,9 @@ void EnableGravity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame,
 
     *aOut = 0;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        vehicle->physicsData->unk1B0 = is_enable;
+        g_fly_vehicle->physicsData->unk1B0 = is_enable;
         *aOut = 1;
     }
 }
@@ -328,10 +335,10 @@ void AddVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, f
 
     *aOut = 0;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        vehicle->physicsData->velocity += velocity;
-        vehicle->physicsData->angularVelocity += angularVelocity;
+        g_fly_vehicle->physicsData->velocity += velocity;
+        g_fly_vehicle->physicsData->angularVelocity += angularVelocity;
         *aOut = 1;
     }
 }
@@ -350,10 +357,10 @@ void AddForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, floa
 
     *aOut = 0;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        vehicle->physicsData->force += force;
-        vehicle->physicsData->torque += torque;
+        g_fly_vehicle->physicsData->force += force;
+        g_fly_vehicle->physicsData->torque += torque;
         *aOut = 1;
     }
 }
@@ -375,20 +382,20 @@ void ChangeVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame
 
     *aOut = 0;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
         if (switchIndex == 1)
         {
-            vehicle->physicsData->velocity = velocity;
+            g_fly_vehicle->physicsData->velocity = velocity;
         }
         else if (switchIndex == 2)
         {
-            vehicle->physicsData->angularVelocity = angularVelocity;
+            g_fly_vehicle->physicsData->angularVelocity = angularVelocity;
         }
         else
         {
-            vehicle->physicsData->velocity = velocity;
-            vehicle->physicsData->angularVelocity = angularVelocity;
+            g_fly_vehicle->physicsData->velocity = velocity;
+            g_fly_vehicle->physicsData->angularVelocity = angularVelocity;
         }
         *aOut = 1;
     }
@@ -406,20 +413,20 @@ void ChangeForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, f
     RED4ext::GetParameter(aFrame, &switchIndex);
     aFrame->code++; // skip ParamEnd
     *aOut = 0;
-    if (vehicle)
+    if (g_fly_vehicle)
     {
         if (switchIndex == 1)
         {
-            vehicle->physicsData->force = force;
+            g_fly_vehicle->physicsData->force = force;
         }
         else if (switchIndex == 2)
         {
-            vehicle->physicsData->torque = torque;
+            g_fly_vehicle->physicsData->torque = torque;
         }
         else
         {
-            vehicle->physicsData->force = force;
-            vehicle->physicsData->torque = torque;
+            g_fly_vehicle->physicsData->force = force;
+            g_fly_vehicle->physicsData->torque = torque;
         }
         *aOut = 1;
     }
@@ -438,9 +445,9 @@ void GetVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, R
 
     *aOut = velocity;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        *aOut = vehicle->physicsData->velocity;
+        *aOut = g_fly_vehicle->physicsData->velocity;
     }
 }
 
@@ -458,9 +465,9 @@ void GetAngularVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aF
 
     *aOut = angularVelocity;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        *aOut = vehicle->physicsData->angularVelocity;
+        *aOut = g_fly_vehicle->physicsData->angularVelocity;
     }
 }
 
@@ -475,9 +482,9 @@ void GetForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4
     force.Y = 0;
     force.Z = 0;
     *aOut = force;
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        *aOut = vehicle->physicsData->force;
+        *aOut = g_fly_vehicle->physicsData->force;
     }
 }
 
@@ -492,9 +499,9 @@ void GetTorque(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED
     torque.Y = 0;
     torque.Z = 0;
     *aOut = torque;
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        *aOut = vehicle->physicsData->torque;
+        *aOut = g_fly_vehicle->physicsData->torque;
     }
 }
 
@@ -506,9 +513,9 @@ void GetPhysicsState(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFram
 
     *aOut = -1;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        *aOut = vehicle->physicsState;
+        *aOut = g_fly_vehicle->physicsState;
     }
 }
 
@@ -520,9 +527,9 @@ void UnsetPhysicsState(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFr
 
     *aOut = -1;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        vehicle->ForceEnablePhysics();
+        g_fly_vehicle->ForceEnablePhysics();
         *aOut = 1;
     }
 }
@@ -535,9 +542,9 @@ void IsOnGround(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, bo
 
     *aOut = false;
 
-    if (vehicle)
+    if (g_fly_vehicle)
     {
-        *aOut = vehicle->isOnGround;
+        *aOut = g_fly_vehicle->isOnGround;
     }
 }
 
@@ -848,14 +855,14 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::PluginInfo* aInfo)
 {
 #ifdef FLY_TANK_MOD
     aInfo->name = L"Fly Tank API";
-    aInfo->author = L"tidus";
-    aInfo->version = RED4EXT_SEMVER(1, 2, 0);
+    aInfo->author = L"tidusmd";
+    aInfo->version = RED4EXT_SEMVER(1, 2, 3);
     aInfo->runtime = RED4EXT_RUNTIME_INDEPENDENT;
     aInfo->sdk = RED4EXT_SDK_LATEST;
 #else
     aInfo->name = L"DAV API";
-    aInfo->author = L"tidus";
-    aInfo->version = RED4EXT_SEMVER(3, 0, 0);
+    aInfo->author = L"tidusmd";
+    aInfo->version = RED4EXT_SEMVER(3, 1, 1);
     aInfo->runtime = RED4EXT_RUNTIME_INDEPENDENT;
     aInfo->sdk = RED4EXT_SDK_LATEST;
 #endif
