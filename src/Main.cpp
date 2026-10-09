@@ -25,6 +25,155 @@ static uint32_t g_resolve_attempts = 0;
 static std::atomic<uint64_t> g_fly_vehicle_raw{0};
 static std::atomic<float> g_native_mass{0.0f};
 
+// --- Event-driven command state. Lua pushes (action, value) on press/release/axis-change and the DLL
+// holds it, so the control loop no longer re-sends the whole list at 20 Hz. Index = Def.ActionList + 1
+// (Idle = -1). Shadow mode first: compared against the list SetFlightModel pushes.
+static std::atomic<float> g_cmd_val[64];
+static std::atomic<uint32_t> g_cmd_seq{0};
+
+// Phase (input): one command edge. id = Def.ActionList value, value = 0/1 or analog magnitude.
+void SetNativeCommand(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t id = 0;
+    float value = 0.0f;
+    RED4ext::GetParameter(aFrame, &id);
+    RED4ext::GetParameter(aFrame, &value);
+    aFrame->code++;
+    // Nothing (0) means "no input": clear the whole held state. Used for dismount/menu/abort resets.
+    if (id == 0)
+    {
+        for (int i = 0; i < 64; ++i)
+            g_cmd_val[i].store(0.0f, std::memory_order_relaxed);
+        g_cmd_seq.fetch_add(1, std::memory_order_relaxed);
+        *aOut = 1.0f;
+        return;
+    }
+    const int idx = static_cast<int>(id) + 1;
+    if (idx >= 0 && idx < 64)
+    {
+        g_cmd_val[idx].store(value, std::memory_order_relaxed);
+        g_cmd_seq.fetch_add(1, std::memory_order_relaxed);
+        *aOut = 1.0f;
+        return;
+    }
+    *aOut = 0.0f; // out of range: Lua should not send this
+}
+
+// Build the command list from the event-pushed held state. Nothing (0) and Idle (-1) are never stored,
+// so an empty table yields an empty list - the same no-op the pushed Nothing entry produced.
+static int BuildHeldCommands(int* aActions, float* aValues, int aMax)
+{
+    int n = 0;
+    for (int i = 0; i < 64 && n < aMax; ++i)
+    {
+        const float v = g_cmd_val[i].load(std::memory_order_relaxed);
+        if (v == 0.0f)
+            continue;
+        aActions[n] = i - 1;
+        aValues[n] = v;
+        ++n;
+    }
+    return n;
+}
+
+// --- Stage 0 (self-supplied attitude): can the physics thread read the entity transform itself?
+// Offsets come from RTTI property names, so no relocation hash is involved. Resolution runs on the
+// game thread; the physics hook only reads the resolved offset.
+static std::atomic<int32_t> g_att_offset{-1};
+static std::atomic<int32_t> g_wpos_offset{-1};
+
+static void ResolveEntityTransformOffsets()
+{
+    if (g_att_offset.load(std::memory_order_relaxed) >= 0)
+        return;
+    auto rtti = RED4ext::CRTTISystem::Get();
+    if (rtti == nullptr)
+        return;
+    int32_t att = -1;
+    int32_t pos = -1;
+    int found_classes = 0;
+    uint32_t last_props = 0;
+    const char* candidates[] = {"worldObject", "worldEntity", "gameObject"};
+    for (const char* cname : candidates)
+    {
+        auto cls = rtti->GetClass(cname);
+        if (cls == nullptr)
+            continue;
+        ++found_classes;
+        RED4ext::DynArray<RED4ext::CProperty*> props;
+        cls->GetProperties(props);
+        last_props = static_cast<uint32_t>(props.size);
+        for (uint32_t i = 0; i < props.size; ++i)
+        {
+            const char* nm = props[i]->name.ToString();
+            if (nm == nullptr)
+                continue;
+            if (att < 0 && std::strcmp(nm, "worldOrientation") == 0)
+                att = static_cast<int32_t>(props[i]->valueOffset);
+            else if (pos < 0 && std::strcmp(nm, "worldPosition") == 0)
+                pos = static_cast<int32_t>(props[i]->valueOffset);
+        }
+        if (att >= 0)
+            break;
+    }
+    g_att_offset.store(att, std::memory_order_relaxed);
+    g_wpos_offset.store(pos, std::memory_order_relaxed);
+    if (g_sdk)
+    {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "DAV dbg: transform offsets orientation=%d position=%d classes=%d props=%u", att,
+                      pos, found_classes, last_props);
+        g_sdk->logger->Info(g_plugin_handle, buf);
+    }
+}
+
+// vehicle::BaseObject stores the entity transform directly (see vehicleBaseObject.hpp):
+//   physics @0x2C8, physicsData @0x2D0, curveSetData @0x2D8, chassis @0x2E8, unk2F8[16] @0x2F8,
+//   chassisType @0x338, worldTransform @0x340 (WorldTransform = Position @0x00, Orientation @0x10),
+//   unk360 @0x360 -- the arithmetic closes, so the offsets are not guesses.
+// The game writes this same field in vehicleBaseObject sub_280 ("applies worldTransform to ... this->worldTransform").
+constexpr int32_t kVehicleWorldTransform = 0x340;
+constexpr int32_t kVehicleWorldOrientation = 0x350;
+
+// Use the fixed offsets when RTTI has no such property (it does not: these are C++-only members).
+static void UseFixedTransformOffsets()
+{
+    if (g_att_offset.load(std::memory_order_relaxed) >= 0)
+        return;
+    g_att_offset.store(kVehicleWorldOrientation, std::memory_order_relaxed);
+    g_wpos_offset.store(kVehicleWorldTransform, std::memory_order_relaxed);
+    if (g_sdk)
+        g_sdk->logger->Info(g_plugin_handle, "DAV dbg: transform offsets from vehicleBaseObject: orientation=0x350 position=0x340");
+}
+
+// Stage 0b: RTTI does not expose the entity transform, so locate the orientation field empirically
+// by matching the quaternion CET pushes. Runs a few times per session, then stops.
+static int ScanForQuaternion(const void* aBase, const float* aWant, int aMaxBytes)
+{
+    const auto* f = reinterpret_cast<const float*>(aBase);
+    const int words = aMaxBytes / 4;
+    float best = 0.0f;
+    int best_off = -1;
+    for (int i = 0; i + 3 < words; ++i)
+    {
+        const float* c = f + i;
+        const float n2 = c[0] * c[0] + c[1] * c[1] + c[2] * c[2] + c[3] * c[3];
+        if (!(n2 > 0.9f && n2 < 1.1f)) // unit-norm candidates only
+            continue;
+        float dot = c[0] * aWant[0] + c[1] * aWant[1] + c[2] * aWant[2] + c[3] * aWant[3];
+        if (dot < 0.0f)
+            dot = -dot; // q and -q are the same rotation
+        if (dot > best)
+        {
+            best = dot;
+            best_off = i * 4;
+        }
+    }
+    return (best > 0.999f) ? best_off : -1;
+}
+
 static std::atomic<float> g_native_gravity{1.0f};
 
 // Desired gravity state; the hook applies it every tick because a one-shot write can be dropped.
@@ -472,6 +621,16 @@ static float g_fm_heli_lift = 0.0f;
 static inline float fm_deg(float r) { return r * (180.0f / 3.14159265358979323846f); }
 static inline float fm_rad(float d) { return d * (3.14159265358979323846f / 180.0f); }
 
+// Wrap an angle delta into [-180,180].
+static inline float fm_wrap180(float a)
+{
+    while (a > 180.0f)
+        a -= 360.0f;
+    while (a < -180.0f)
+        a += 360.0f;
+    return a;
+}
+
 // Port of Utils:CalculateRotationalSpeed (local_yaw fixed at 0); outputs (d_pitch, d_roll, d_yaw).
 static void RotSpeed(float lr, float lp, float cur_roll, float cur_pitch, float cur_yaw,
                      float& d_pitch, float& d_roll, float& d_yaw)
@@ -500,11 +659,13 @@ static void RotSpeed(float lr, float lp, float cur_roll, float cur_pitch, float 
     float nr = fm_deg(std::atan2(R[1][0], R[0][0]));
     float np = fm_deg(std::atan2(-R[2][0], std::sqrt(R[2][1] * R[2][1] + R[2][2] * R[2][2])));
     float ny = fm_deg(std::atan2(R[2][1], R[2][2]));
-    // The Lua caller binds the first return value (new_pitch - pitch) to d_roll, so roll and pitch
-    // deltas are deliberately crossed there; reproducing that crossing is what makes the restore work.
-    d_roll = np - cur_pitch;
-    d_pitch = nr - cur_roll;
-    d_yaw = ny - cur_yaw;
+    // The Lua caller binds the FIRST return value (new_pitch - pitch) to d_roll and the second
+    // (new_roll - roll) to d_pitch, then does roll += d_roll / pitch += d_pitch. The crossing is in
+    // the original and must be reproduced exactly; without it the helicopter's lean axes permute.
+    // Also wrapped to [-180,180]: at cur_yaw = 179.96 the raw difference jumped to -359.90 in-game.
+    d_roll = fm_wrap180(np - cur_pitch);
+    d_pitch = fm_wrap180(nr - cur_roll);
+    d_yaw = fm_wrap180(ny - cur_yaw);
 }
 // Clamp a flight-model target to a sane range.
 static inline float fm_clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -536,18 +697,40 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
     const float acc = dt / 0.01f; // BASE_RESOLUTION = 0.01 s
     const bool heli = m.flight_mode == 1;
 
-    // Attitude source: the Lua reads GetWorldOrientation() of the entity, so use the quaternion CET
-    // pushed. physicsData->orientation is a different field and is only a fallback.
+    // Attitude source, best first: the transform the game maintains on the entity itself (read
+    // straight off vehicle::BaseObject on the physics thread; verified identical to what CET
+    // pushes), then CET's push, then the physics field. The common path needs no game-thread feed.
     RED4ext::Quaternion q = pd->orientation;
+    bool q_from_entity = false;
+    const int32_t att_off = g_att_offset.load(std::memory_order_relaxed);
+    if (att_off >= 0 && pd->vehicle != nullptr)
+    {
+        const auto* ent = reinterpret_cast<const RED4ext::Quaternion*>(reinterpret_cast<uintptr_t>(pd->vehicle) +
+                                                                       att_off);
+        const float n2 = ent->i * ent->i + ent->j * ent->j + ent->k * ent->k + ent->r * ent->r;
+        if (std::isfinite(n2) && n2 > 0.9f && n2 < 1.1f)
+        {
+            q = *ent;
+            q_from_entity = true;
+        }
+    }
     const float cq_norm = std::sqrt(m.cetq[0] * m.cetq[0] + m.cetq[1] * m.cetq[1] + m.cetq[2] * m.cetq[2] +
                                     m.cetq[3] * m.cetq[3]);
     const bool cetq_usable = std::isfinite(cq_norm) && cq_norm > 0.5f && cq_norm < 2.0f;
-    if (cetq_usable)
+    if (!q_from_entity && cetq_usable)
     {
         q.i = m.cetq[0];
         q.j = m.cetq[1];
         q.k = m.cetq[2];
         q.r = m.cetq[3];
+    }
+    if (!q_from_entity && cetq_usable && pd->vehicle != nullptr && g_sdk)
+    {
+        // The fixed offset failed: report where the matching quaternion actually lives (once).
+        const int off = ScanForQuaternion(pd->vehicle, m.cetq, 0x600);
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), "DAV dbg: att fallback scan vehicle_off=0x%X", off);
+        g_sdk->logger->Info(g_plugin_handle, buf);
     }
     const float qn = std::sqrt(q.i * q.i + q.j * q.j + q.k * q.k + q.r * q.r);
     if (qn > 0.0f)
@@ -577,9 +760,8 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
         uy = m.ax[7];
         uz = m.ax[8];
     }
-    // Physical Euler angles (bank, nose, heading) - what the game's ToEulerAngles reports and what
-    // the Lua feeds to CalculateRotationalSpeed. RotSpeed's first parameter is the rotation about
-    // world Z, so the raw extraction swaps roll and yaw; leaving them swapped breaks the restore.
+    // Fallback attitude, used only if Lua stops pushing. The Lua's ToEulerAngles convention differs
+    // from this extraction (roll/pitch sign and a 90 degree yaw offset), so the push is authoritative.
     const float cur_roll_ext = fm_deg(std::atan2(rz, uz));
     const float cur_pitch_ext = fm_deg(std::atan2(-fz, std::sqrt(rz * rz + uz * uz)));
     const float cur_yaw_ext = fm_deg(std::atan2(fy, fx));
@@ -596,16 +778,32 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
     float rpm = g_fm_rpm.load(std::memory_order_relaxed);
     const float max_rpm = 10.0f * p.rpm_scale;
 
-    for (int i = 0; i < m.ncmd; i++)
+    // Event-driven input: once Lua has pushed any command edge, the held state replaces the list that
+    // SetFlightModel pushes. Before the first edge the pushed list is used unchanged.
+    int act_buf[6];
+    float val_buf[6];
+    const int* use_action = m.action;
+    const float* use_value = m.value;
+    int use_ncmd = m.ncmd;
+    if (g_cmd_seq.load(std::memory_order_relaxed) > 0)
     {
-        const int a = m.action[i];
-        const float v = m.value[i];
+        use_ncmd = BuildHeldCommands(act_buf, val_buf, 6);
+        use_action = act_buf;
+        use_value = val_buf;
+    }
+
+    for (int i = 0; i < use_ncmd; i++)
+    {
+        const int a = use_action[i];
+        const float v = use_value[i];
 
         // Idle: CalculateAddVelocity resets RPM and returns CalculateIdleMode (pitch restore only).
         if (a == -1)
         {
             rpm = 0.0f;
             float lp_idle = 0.0f;
+            // Signs flipped to match the swapped RotSpeed slots: arg1 positive drives the nose down,
+            // so a nose-up error has to add to lp_idle (negative feedback, verified offline).
             if (cur_pitch > p.pitch_restore_amount)
                 lp_idle -= RestoreRate(cur_pitch - p.pitch_restore_amount, p.pitch_restore_amount,
                                        p.restore_boundary_deg, dt_scale);
@@ -676,7 +874,7 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
                 else if (cur_roll < 0) lr -= p.roll_change_amount * ((p.max_roll + cur_roll) / p.max_roll);
                 else lr -= p.roll_change_amount;
                 break;
-            case 5: // LeanForward
+            case 5: // LeanForward (faithful to the Lua: local_pitch -= pitch_change_amount)
                 if (cur_pitch < -p.max_pitch) lp = 0;
                 else if (cur_pitch < 0) lp -= p.pitch_change_amount * ((p.max_pitch + cur_pitch) / p.max_pitch);
                 else lp -= p.pitch_change_amount;
@@ -697,7 +895,7 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
         {
             switch (a)
             {
-            case 23: // HLeanForward
+            case 23: // HLeanForward (faithful to the Lua: local_pitch -= h_pitch_change)
                 if (cur_pitch < -p.max_pitch) lp = 0;
                 else if (cur_pitch < 0) lp -= p.h_pitch_change * ((p.max_pitch + cur_pitch) / p.max_pitch);
                 else lp -= p.h_pitch_change;
@@ -733,6 +931,8 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
             }
         }
         float dp, dr, dy;
+        // Lua argument order (local_roll, local_pitch); RotSpeed reproduces the original's crossed
+        // return values, which is what makes the axes come out right.
         RotSpeed(lr, lp, cur_roll, cur_pitch, cur_yaw, dp, dr, dy);
         croll += dr; cpitch += dp; cyaw += dy;
         x += cx * v; y += cy * v; z += cz * v;
@@ -747,6 +947,7 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
     const bool has_gravity = pd->unk1B0 != 0;
     if (heli || has_gravity)
     {
+        // Signs follow the Lua exactly: restore always subtracts from the positive side.
         if (cur_pitch > pitch_restore)
             lp2 -= RestoreRate(cur_pitch - pitch_restore, pitch_restore, p.restore_boundary_deg, dt_scale);
         else if (cur_pitch < -pitch_restore)
@@ -758,6 +959,10 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
         lr2 += RestoreRate(-cur_roll - roll_restore, roll_restore, p.restore_boundary_deg, dt_scale);
     if (cur_roll > p.max_roll) lr2 -= (cur_roll - p.max_roll) * 0.5f;
     else if (cur_roll < -p.max_roll) lr2 += (-p.max_roll - cur_roll) * 0.5f;
+    // Pitch had no over-limit correction while roll did, so past max_pitch only the weak 0.2/tick
+    // restore opposed the motion and the helicopter ran all the way to vertical. Symmetric now.
+    if (cur_pitch > p.max_pitch) lp2 -= (cur_pitch - p.max_pitch) * 0.5f;
+    else if (cur_pitch < -p.max_pitch) lp2 += (-p.max_pitch - cur_pitch) * 0.5f;
     if (cur_roll > p.force_restore_angle || cur_roll < -p.force_restore_angle) lr2 = -cur_roll;
     else if (cur_pitch > p.force_restore_angle || cur_pitch < -p.force_restore_angle) lp2 = -cur_pitch;
     {
@@ -948,6 +1153,8 @@ void SetVehicle(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, fl
     is_enable_original_physics = true;
     g_resolve_attempts = 0; // SetVehicle always gets an immediate attempt
     TryResolveVehicle("SetVehicle");
+    ResolveEntityTransformOffsets();
+    UseFixedTransformOffsets();
 
     *aOut = 0;
 
@@ -1967,6 +2174,22 @@ RED4EXT_C_EXPORT void RED4EXT_CALL RegisterFlyAVSystem()
 #endif
 }
 
+// Phase (input): SetNativeCommand native.
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetNativeCommand()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    auto func = RED4ext::CClassFunction::Create(&cls, "SetNativeCommand", "SetNativeCommand", &SetNativeCommand,
+                                                {.isNative = true});
+    func->flags = RED4ext::CBaseFunction::Flags{.isNative = true};
+    func->SetReturnType("Float");
+    func->AddParam("Int32", "action_id");
+    func->AddParam("Float", "value");
+    cls.RegisterFunction(func);
+}
+
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetVehicle()
 {
     auto rtti = RED4ext::CRTTISystem::Get();
@@ -2424,6 +2647,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddRegisterCallback(RegisterFlyAVSystem);
 #endif
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetVehicle);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetNativeCommand);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterEnableOriginalPhysics);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetMass);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterHasGravity);
