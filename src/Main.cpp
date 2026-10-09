@@ -737,16 +737,26 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
     {
         q.i /= qn; q.j /= qn; q.k /= qn; q.r /= qn;
     }
-    float fx = 1.0f - 2.0f * (q.j * q.j + q.k * q.k); // forward = AxisX
-    float fy = 2.0f * (q.i * q.j + q.r * q.k);
-    float fz = 2.0f * (q.i * q.k - q.r * q.j);
-    float rx = 2.0f * (q.i * q.j - q.r * q.k); // right = AxisY
-    float ry = 1.0f - 2.0f * (q.i * q.i + q.k * q.k);
-    float rz = 2.0f * (q.j * q.k + q.r * q.i);
+    // Measured against the game's GetForward/GetRight/GetUp across banked and pitched samples: the
+    // entity quaternion's local axes are forward = AxisY, right = AxisX, up = AxisZ. X and Y are
+    // swapped relative to the usual assumption, which is what made the attitude look sign-flipped.
+    float fx = 2.0f * (q.i * q.j - q.r * q.k); // forward = AxisY
+    float fy = 1.0f - 2.0f * (q.i * q.i + q.k * q.k);
+    float fz = 2.0f * (q.j * q.k + q.r * q.i);
+    float rx = 1.0f - 2.0f * (q.j * q.j + q.k * q.k); // right = AxisX
+    float ry = 2.0f * (q.i * q.j + q.r * q.k);
+    float rz = 2.0f * (q.i * q.k - q.r * q.j);
     float ux = 2.0f * (q.i * q.k + q.r * q.j); // up = AxisZ
     float uy = 2.0f * (q.j * q.k - q.r * q.i);
     float uz = 1.0f - 2.0f * (q.i * q.i + q.j * q.j);
-    // The Lua thrust math uses the entity's GetWorldForward/Right/Up; use those when pushed.
+    // Game Euler convention, derived from the same measurement and verified on steep bank/pitch:
+    //   roll = atan2(-right_z, hypot(forward_z, up_z)), pitch = atan2(forward_z, up_z),
+    //   yaw = heading of the right vector.
+    const float game_roll_ext = fm_deg(std::atan2(-rz, std::sqrt(fz * fz + uz * uz)));
+    const float game_pitch_ext = fm_deg(std::atan2(fz, uz));
+    const float game_yaw_ext = fm_wrap180(fm_deg(std::atan2(ry, rx)));
+    // The Lua thrust math used the entity's GetWorldForward/Right/Up; the DLL now derives the same
+    // vectors from the quaternion, so a pushed set still wins when one arrives (older CET builds).
     const bool ax_usable = m.ax_valid != 0.0f && std::isfinite(m.ax[0] + m.ax[4] + m.ax[8]);
     if (ax_usable)
     {
@@ -760,13 +770,13 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
         uy = m.ax[7];
         uz = m.ax[8];
     }
-    // Fallback attitude, used only if Lua stops pushing. The Lua's ToEulerAngles convention differs
-    // from this extraction (roll/pitch sign and a 90 degree yaw offset), so the push is authoritative.
-    const float cur_roll_ext = fm_deg(std::atan2(rz, uz));
-    const float cur_pitch_ext = fm_deg(std::atan2(-fz, std::sqrt(rz * rz + uz * uz)));
-    const float cur_yaw_ext = fm_deg(std::atan2(fy, fx));
-    // Prefer the attitude pushed by Lua (CET's own ToEulerAngles); a garbage value would turn the
-    // restore into a violent spin.
+    // Attitude from the entity quaternion, converted to the game's ToEulerAngles convention. Measured
+    // against CET across many samples: game_roll = -ext_roll, game_pitch = -ext_pitch and
+    // game_yaw = ext_yaw - 90. With the conversion the DLL is self-sufficient for attitude.
+    const float cur_roll_ext = game_roll_ext;
+    const float cur_pitch_ext = game_pitch_ext;
+    const float cur_yaw_ext = game_yaw_ext;
+    // A pushed attitude still wins when present; a garbage value would turn the restore into a spin.
     const bool att_sane = m.att_valid != 0.0f && std::isfinite(m.att[0]) && std::isfinite(m.att[1]) &&
                           std::isfinite(m.att[2]) && std::abs(m.att[0]) <= 540.0f &&
                           std::abs(m.att[1]) <= 540.0f && std::abs(m.att[2]) <= 540.0f;
