@@ -563,6 +563,7 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 611586815, ApplyForceAtPosition, RED4ext
 // --- Phase B-1/B-2: vehicle physics fixed-update hook (physics thread, once per tick per vehicle) ---
 static std::atomic<uint32_t> g_hook_thread_id{0};
 static std::atomic<uint64_t> g_native_tick_count{0};
+static std::atomic<uint64_t> g_native_phys_enable{0};
 static std::atomic<float> g_native_last_dt{0.0f};
 
 // Flight control state pushed from CET (game thread), read on the physics thread (double buffer).
@@ -1065,6 +1066,20 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
         }
         // Publish the object for the game thread; Handle ref-counting must stay off this thread.
         g_fly_vehicle_raw.store(reinterpret_cast<uint64_t>(physics->parent), std::memory_order_release);
+        // Safety net, held every tick the way gravity is: if the game left our body in a non-simulated
+        // state, put it back. Never observed firing in testing, kept in case a spawn path needs it.
+        if (physics->parent->physicsState != 0)
+        {
+            physics->parent->ForceEnablePhysics();
+            const uint64_t n = g_native_phys_enable.fetch_add(1, std::memory_order_relaxed);
+            if (n < 3 && g_sdk)
+            {
+                char pbuf[128];
+                std::snprintf(pbuf, sizeof(pbuf), "DAV dbg: hook re-enabled physics (#%llu)",
+                              (unsigned long long)n);
+                g_sdk->logger->Info(g_plugin_handle, pbuf);
+            }
+        }
         // Tick probe read by CET's watchdog: if it stops advancing while we drive, fall back to Lua.
         g_native_tick_count.fetch_add(1, std::memory_order_relaxed);
         g_native_last_dt.store(deltaTime, std::memory_order_relaxed);
