@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <excpt.h>
 #include <string>
 #include <vector>
 
@@ -573,6 +574,301 @@ static std::atomic<float> g_av_on_ground{0.0f};
 static std::atomic<uint64_t> g_native_tick_count{0};
 static std::atomic<uint64_t> g_native_phys_enable{0};
 static std::atomic<float> g_native_last_dt{0.0f};
+
+//////////////////////////////////////////////////////////////////////////////////
+// Phase C: the ground raycast, moved out of CET.
+//
+// The query is the game's own - the global script function GetSpatialQueriesSystem() and its
+// SyncRaycastByQueryFilter method, which is exactly what Lua was calling. Nothing about the
+// signature is hardcoded: parameter roles, the filter's mask offsets and the hit position's offset
+// are read out of RTTI on first use. A game update that reorders a parameter disables the raycast
+// instead of writing past a buffer, and Lua's own raycast keeps working underneath.
+//////////////////////////////////////////////////////////////////////////////////
+static std::atomic<float> g_query_offset{2.0f};     // start the ray this far above the vehicle
+static std::atomic<float> g_query_distance{100.0f}; // how far down to look
+static std::atomic<uint64_t> g_query_mask1{0};
+// The bits the default collision_filters produce. This is a floor, not the answer: the groups come
+// from a user setting, and which bit a group lands on can move between game versions, so Lua's
+// AddGroup result stays the primary source and only fails to arrive if CET never got the chance.
+static std::atomic<uint64_t> g_query_mask2{144115188075855872ULL};
+
+struct GroundRayLayout
+{
+    enum Role : uint8_t
+    {
+        kFrom = 0,
+        kTo,
+        kFilter,
+        kBool,
+        kOut,
+        kSkip,
+    };
+
+    bool probed = false;
+    bool usable = false;
+    const char* why = "not probed";
+
+    RED4ext::CBaseFunction* get_sys = nullptr;
+    RED4ext::CBaseFunction* func = nullptr;
+    std::vector<uint8_t> roles;
+    uint32_t filter_size = 0;
+    int32_t mask1_off = -1;
+    int32_t mask2_off = -1;
+    uint32_t out_size = 0;
+    int32_t hit_z_off = -1;
+    int32_t param_count = 0;
+};
+static GroundRayLayout g_ray;
+static bool g_ray_reported = false;
+
+static void ReportGroundRay()
+{
+    if (g_ray_reported || g_sdk == nullptr)
+    {
+        return;
+    }
+    g_ray_reported = true;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "DAV dbg: ground ray %s (%s) params=%d filter=%u m1=%d m2=%d out=%u hit_z=%d",
+                  g_ray.usable ? "ready" : "off", g_ray.why, g_ray.param_count, g_ray.filter_size, g_ray.mask1_off,
+                  g_ray.mask2_off, g_ray.out_size, g_ray.hit_z_off);
+    g_sdk->logger->Info(g_plugin_handle, buf);
+}
+
+// Property offset inside a struct type, or -1. Structures are CClass in this SDK, so the same lookup
+// serves the collision filter and the hit info.
+static int32_t FindPropertyOffset(RED4ext::CBaseRTTIType* aType, const char* aName)
+{
+    if (aType == nullptr || aType->GetType() != RED4ext::ERTTIType::Class)
+    {
+        return -1;
+    }
+    auto* cls = static_cast<RED4ext::CClass*>(aType);
+    RED4ext::DynArray<RED4ext::CProperty*> props;
+    cls->GetProperties(props);
+    for (uint32_t i = 0; i < props.size; ++i)
+    {
+        auto* p = props[i];
+        if (p != nullptr && p->name == aName)
+        {
+            return static_cast<int32_t>(p->valueOffset);
+        }
+    }
+    return -1;
+}
+
+// A wrong layout is an access violation rather than a C++ exception, and the game would take it.
+// Kept in its own function with nothing that needs unwinding so the guard is legal.
+static bool SafeExecute(void* aInstance, RED4ext::CBaseFunction* aFunc, void* aOut, RED4ext::StackArgs_t* aArgs)
+{
+    __try
+    {
+        return RED4ext::ExecuteFunction(aInstance, aFunc, aOut, *aArgs);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Read the query's shape out of RTTI. Game thread only. Retries until a world is loaded, then stops.
+static bool ResolveGroundRay()
+{
+    if (g_ray.usable)
+    {
+        return true;
+    }
+    g_ray.probed = true;
+    auto* rtti = RED4ext::CRTTISystem::Get();
+    if (rtti == nullptr)
+    {
+        g_ray.why = "rtti missing";
+        ReportGroundRay();
+        return false;
+    }
+    g_ray.get_sys = rtti->GetFunction("GetSpatialQueriesSystem");
+    if (g_ray.get_sys == nullptr)
+    {
+        g_ray.why = "GetSpatialQueriesSystem missing";
+        ReportGroundRay();
+        return false;
+    }
+
+    void* sys = nullptr;
+    RED4ext::StackArgs_t none;
+    if (!SafeExecute(nullptr, g_ray.get_sys, &sys, &none) || sys == nullptr)
+    {
+        // No world yet (boot, or between saves). Not an error - try again next frame.
+        return false;
+    }
+
+    auto* cls = reinterpret_cast<RED4ext::IScriptable*>(sys)->GetType();
+    auto* func = (cls != nullptr) ? cls->GetFunction("SyncRaycastByQueryFilter") : nullptr;
+    if (func == nullptr)
+    {
+        g_ray.why = "SyncRaycastByQueryFilter missing";
+        ReportGroundRay();
+        return false;
+    }
+    g_ray.func = func;
+
+    bool have_from = false;
+    bool have_to = false;
+    for (uint32_t i = 0; i < func->params.size; ++i)
+    {
+        auto* p = func->params[i];
+        auto* t = (p != nullptr) ? p->type : nullptr;
+        if (t == nullptr)
+        {
+            g_ray.why = "param without a type";
+            ReportGroundRay();
+            return false;
+        }
+        g_ray.param_count = static_cast<int32_t>(i) + 1;
+        uint8_t role = GroundRayLayout::kBool;
+        if (p->flags.isReturn)
+        {
+            role = GroundRayLayout::kSkip; // the return slot is not a stack argument
+        }
+        else if (p->flags.isOut)
+        {
+            role = GroundRayLayout::kOut;
+            g_ray.out_size = t->GetSize();
+            const int32_t pos_off = FindPropertyOffset(t, "position");
+            if (pos_off < 0 || static_cast<uint32_t>(pos_off) + 12 > g_ray.out_size)
+            {
+                g_ray.why = "hit info has no usable position";
+                ReportGroundRay();
+                return false;
+            }
+            g_ray.hit_z_off = pos_off + 8; // Vector3 and Vector4 both put z third
+        }
+        else
+        {
+            const RED4ext::CName tn = t->GetName();
+            if (tn == "Vector4" && !have_from)
+            {
+                role = GroundRayLayout::kFrom;
+                have_from = true;
+            }
+            else if (tn == "Vector4")
+            {
+                role = GroundRayLayout::kTo;
+                have_to = true;
+            }
+            else if (tn == "Boolean")
+            {
+                role = GroundRayLayout::kBool;
+            }
+            else
+            {
+                // The collision filter, whatever the game calls it this patch.
+                const char* s = tn.ToString();
+                if (s != nullptr && std::strstr(s, "QueryFilter") != nullptr)
+                {
+                    role = GroundRayLayout::kFilter;
+                    g_ray.filter_size = t->GetSize();
+                    g_ray.mask1_off = FindPropertyOffset(t, "mask1");
+                    g_ray.mask2_off = FindPropertyOffset(t, "mask2");
+                    if (g_ray.filter_size < 16 || (g_ray.mask1_off < 0 && g_ray.mask2_off < 0))
+                    {
+                        g_ray.why = "cannot find the filter masks";
+                        ReportGroundRay();
+                        return false;
+                    }
+                }
+                else
+                {
+                    g_ray.why = "unexpected parameter";
+                    ReportGroundRay();
+                    return false;
+                }
+            }
+        }
+        g_ray.roles.push_back(role);
+    }
+    if (!have_from || !have_to || g_ray.out_size == 0)
+    {
+        g_ray.why = "signature not understood";
+        ReportGroundRay();
+        return false;
+    }
+    g_ray.usable = true;
+    g_ray.why = "ok";
+    ReportGroundRay();
+    return true;
+}
+
+// One downward query, from (ax, ay, aTop) to aDist below it. Game thread only - it walks the live
+// physics scene, which is what CET's own loop used to pay for.
+static bool RaycastGroundZ(float ax, float ay, float aTop, float aDist, float* aOutZ)
+{
+    if (!ResolveGroundRay())
+    {
+        return false;
+    }
+    void* sys = nullptr;
+    RED4ext::StackArgs_t none;
+    if (!SafeExecute(nullptr, g_ray.get_sys, &sys, &none) || sys == nullptr)
+    {
+        return false;
+    }
+
+    RED4ext::Vector4 from{ax, ay, aTop, 1.0f};
+    RED4ext::Vector4 to{ax, ay, aTop - aDist, 1.0f};
+    std::vector<uint8_t> filter(g_ray.filter_size, 0);
+    const uint64_t m1 = g_query_mask1.load(std::memory_order_relaxed);
+    const uint64_t m2 = g_query_mask2.load(std::memory_order_relaxed);
+    if (g_ray.mask1_off >= 0)
+    {
+        std::memcpy(filter.data() + g_ray.mask1_off, &m1, sizeof(m1));
+    }
+    if (g_ray.mask2_off >= 0)
+    {
+        std::memcpy(filter.data() + g_ray.mask2_off, &m2, sizeof(m2));
+    }
+    std::vector<uint8_t> out(g_ray.out_size, 0);
+    bool is_false = false;
+
+    RED4ext::StackArgs_t args;
+    for (size_t i = 0; i < g_ray.roles.size(); ++i)
+    {
+        switch (g_ray.roles[i])
+        {
+        case GroundRayLayout::kFrom:
+            args.emplace_back(nullptr, &from);
+            break;
+        case GroundRayLayout::kTo:
+            args.emplace_back(nullptr, &to);
+            break;
+        case GroundRayLayout::kFilter:
+            args.emplace_back(nullptr, filter.data());
+            break;
+        case GroundRayLayout::kOut:
+            args.emplace_back(nullptr, out.data());
+            break;
+        case GroundRayLayout::kSkip:
+            break;
+        default:
+            args.emplace_back(nullptr, &is_false);
+            break;
+        }
+    }
+
+    bool is_hit = false;
+    if (!SafeExecute(sys, g_ray.func, &is_hit, &args) || !is_hit)
+    {
+        return false;
+    }
+    float z = 0.0f;
+    std::memcpy(&z, out.data() + g_ray.hit_z_off, sizeof(z));
+    if (!std::isfinite(z))
+    {
+        return false;
+    }
+    *aOutZ = z;
+    return true;
+}
 
 // Flight control state pushed from CET (game thread), read on the physics thread (double buffer).
 struct FlightControlState
@@ -2361,6 +2657,12 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
     RED4EXT_UNUSED_PARAMETER(aApp);
     g_game_thread_id.store(static_cast<uint32_t>(GetCurrentThreadId()), std::memory_order_relaxed);
     const uint64_t n = g_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Resolve the query's shape as soon as a world exists, whether or not the vehicle is flying, so
+    // the diagnostic lands in the log instead of waiting for someone to take off.
+    if (!g_ray.usable && (n % 30) == 0)
+    {
+        ResolveGroundRay();
+    }
     if (n == 1 && g_sdk)
     {
         char buf[128];
@@ -2387,6 +2689,22 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
             {
                 g_ground_z.store(z, std::memory_order_relaxed);
                 g_ground_valid.store(1.0f, std::memory_order_relaxed);
+            }
+            // Query on the cadence the hover actually consumes the answer on: twice a second, and
+            // only while the native hover is running. Airborne is the case contact cannot cover -
+            // over a rooftop edge or a pit the last contact is the wrong floor - but querying while
+            // landed too keeps the published value honest and makes the whole path observable from
+            // the probe without anyone having to take off. A miss leaves the last known ground alone.
+            const bool hover_active = (g_fc_buf[g_fc_idx.load(std::memory_order_acquire)].mode == 4);
+            if (hover_active && (n % 30) == 0)
+            {
+                float gz = 0.0f;
+                if (RaycastGroundZ(pd->worldPosition.X, pd->worldPosition.Y, z + g_query_offset.load(std::memory_order_relaxed),
+                                   g_query_distance.load(std::memory_order_relaxed), &gz))
+                {
+                    g_ground_z.store(gz, std::memory_order_relaxed);
+                    g_ground_valid.store(1.0f, std::memory_order_relaxed);
+                }
             }
         }
         s_was_on_ground = on_ground;
@@ -2434,6 +2752,29 @@ void GetGroundInfo(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame,
                              g_ground_valid.load(std::memory_order_relaxed)};
 }
 
+// What RTTI cannot tell us: the search box and the collision groups, both of which are user settings.
+void SetGroundQuery(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+
+    float offset;
+    float distance;
+    uint64_t mask1;
+    uint64_t mask2;
+    RED4ext::GetParameter(aFrame, &offset);
+    RED4ext::GetParameter(aFrame, &distance);
+    RED4ext::GetParameter(aFrame, &mask1);
+    RED4ext::GetParameter(aFrame, &mask2);
+    aFrame->code++; // skip ParamEnd
+
+    g_query_offset.store(offset, std::memory_order_relaxed);
+    g_query_distance.store(distance, std::memory_order_relaxed);
+    g_query_mask1.store(mask1, std::memory_order_relaxed);
+    g_query_mask2.store(mask2, std::memory_order_relaxed);
+    *aOut = 1;
+}
+
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetGroundReference()
 {
     auto rtti = RED4ext::CRTTISystem::Get();
@@ -2460,6 +2801,24 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetGroundInfo()
         RED4ext::CClassFunction::Create(&cls, "GetGroundInfo", "GetGroundInfo", &GetGroundInfo, {.isNative = true});
     func->flags = flags;
     func->SetReturnType("Vector4");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetGroundQuery()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    RED4ext::CBaseFunction::Flags flags = {.isNative = true};
+    auto func =
+        RED4ext::CClassFunction::Create(&cls, "SetGroundQuery", "SetGroundQuery", &SetGroundQuery, {.isNative = true});
+    func->flags = flags;
+    func->SetReturnType("Float");
+    func->AddParam("Float", "offset");
+    func->AddParam("Float", "distance");
+    func->AddParam("Uint64", "mask1");
+    func->AddParam("Uint64", "mask2");
     cls.RegisterFunction(func);
 }
 
@@ -2505,6 +2864,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetIdleHoverParams);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetGroundInfo);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetGroundReference);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetGroundQuery);
         // Game-thread cadence: OnUpdate runs once per frame on the game thread.
         g_sdk->gameStates->Add(aHandle, RED4ext::EGameStateType::Running, &g_dav_game_state);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightModel);
