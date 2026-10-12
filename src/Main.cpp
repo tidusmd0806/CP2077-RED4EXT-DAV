@@ -688,6 +688,121 @@ struct FlightTarget
 };
 static FlightTarget g_fm_target = {};
 
+// Phase B-5: native idle hover (Lua mode 4). Engine:CalculateIdleMode used to run in Lua once per
+// Cron tick, and every one of those ticks paid a downward raycast plus several game API calls just
+// to hold a stationary vehicle. Inside the physics hook the velocity, angular velocity, orientation
+// and world position are already in hand, so the same control law runs here for free and Lua only
+// has to refresh the ground reference a couple of times a second.
+struct IdleParams
+{
+    float ground_z;           // world Z of the ground under the AV, pushed by Lua (slow refresh)
+    float dest_height;        // Engine.minimum_distance_to_ground
+    float damping;            // CalculateIdleMode velocity damping (0.2)
+    float height_gain;        // CalculateIdleMode height_gain (0.5)
+    float pitch_band;         // pitch_restore_amount (also the RestoreRate full rate, as in Lua)
+    float roll_band;          // roll_restore_amount
+    float restore_boundary;   // restore_boundary_deg
+    float dt_scale;
+    float max_roll;
+    float max_pitch;
+    float force_restore_angle;
+    float air_h;              // horizontal_air_resistance_const
+    float air_v;              // vertical_air_resistance_const
+    float idle_gravity;       // is_enable_idle_gravity (0 = no altitude term at all)
+    float max_vz;             // safety clamp on the vertical target
+    float valid;
+};
+static IdleParams g_idle_buf[2] = {};
+static std::atomic<int> g_idle_idx{0};
+
+// Game-convention Euler angles from a quaternion. Same formulas FmStep verified in game (local axes
+// are forward = AxisY, right = AxisX, up = AxisZ), kept separate so FmStep stays untouched.
+static void GameEuler(const RED4ext::Quaternion& q, float& roll, float& pitch, float& yaw)
+{
+    const float fz = 2.0f * (q.j * q.k + q.r * q.i);
+    const float rx = 1.0f - 2.0f * (q.j * q.j + q.k * q.k);
+    const float ry = 2.0f * (q.i * q.j + q.r * q.k);
+    const float rz = 2.0f * (q.i * q.k - q.r * q.j);
+    const float uz = 1.0f - 2.0f * (q.i * q.i + q.j * q.j);
+    roll = fm_deg(std::atan2(-rz, std::sqrt(fz * fz + uz * uz)));
+    pitch = fm_deg(std::atan2(fz, uz));
+    yaw = fm_wrap180(fm_deg(std::atan2(ry, rx)));
+}
+
+// One physics tick of the unboarded hover: CalculateIdleMode's law, then Engine:Run's own attitude
+// restore added on top. Lua really does restore twice on this path (CalculateIdleMode returns world
+// rates, Run adds its own d_roll/d_pitch/d_yaw to them) and that stiffness is what the hover feels
+// like, so the duplication is reproduced rather than cleaned up.
+static void IdleStep(const RED4ext::vehicle::PhysicsData* pd, const IdleParams& ip,
+                     RED4ext::Vector3& out_vel, RED4ext::Vector3& out_ang)
+{
+    const RED4ext::Vector3& v = pd->velocity;
+
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    if (ip.idle_gravity != 0.0f)
+    {
+        z = -v.Z * ip.damping;
+        const float h = pd->worldPosition.Z - ip.ground_z;
+        const float dh = ip.dest_height - h;
+        if (std::abs(dh) > 0.01f)
+            z += dh * ip.height_gain;
+        z = fm_clamp(z, -ip.max_vz, ip.max_vz);
+    }
+    // Engine:Run's air resistance, applied after the idle term exactly as in Lua.
+    x -= ip.air_h * v.X;
+    y -= ip.air_h * v.Y;
+    z -= ip.air_v * v.Z;
+    out_vel.X = x;
+    out_vel.Y = y;
+    out_vel.Z = z;
+
+    RED4ext::Quaternion q = pd->orientation;
+    const float qn = std::sqrt(q.i * q.i + q.j * q.j + q.k * q.k + q.r * q.r);
+    if (qn > 0.0f)
+    {
+        q.i /= qn; q.j /= qn; q.k /= qn; q.r /= qn;
+    }
+    float roll, pitch, yaw;
+    GameEuler(q, roll, pitch, yaw);
+
+    // CalculateIdleMode: pitch only (local roll stays 0); the roll/yaw terms come out of the Euler
+    // coupling inside RotSpeed, exactly as they do in Lua.
+    float lp0 = 0.0f;
+    if (pitch > ip.pitch_band)
+        lp0 = -RestoreRate(pitch - ip.pitch_band, ip.pitch_band, ip.restore_boundary, ip.dt_scale);
+    else if (pitch < -ip.pitch_band)
+        lp0 = RestoreRate(-pitch - ip.pitch_band, ip.pitch_band, ip.restore_boundary, ip.dt_scale);
+    else
+        lp0 = -pitch;
+    float dp0, dr0, dy0;
+    RotSpeed(0.0f, lp0, roll, pitch, yaw, dp0, dr0, dy0);
+
+    // Engine:Run's restore (roll and pitch, the max_roll taper, the force-restore hard cut).
+    float lr = 0.0f, lp = 0.0f;
+    if (pitch > ip.pitch_band)
+        lp -= RestoreRate(pitch - ip.pitch_band, ip.pitch_band, ip.restore_boundary, ip.dt_scale);
+    else if (pitch < -ip.pitch_band)
+        lp += RestoreRate(-pitch - ip.pitch_band, ip.pitch_band, ip.restore_boundary, ip.dt_scale);
+    if (roll > ip.roll_band)
+        lr -= RestoreRate(roll - ip.roll_band, ip.roll_band, ip.restore_boundary, ip.dt_scale);
+    else if (roll < -ip.roll_band)
+        lr += RestoreRate(-roll - ip.roll_band, ip.roll_band, ip.restore_boundary, ip.dt_scale);
+    if (roll > ip.max_roll)
+        lr -= (roll - ip.max_roll) * 0.5f;
+    else if (roll < -ip.max_roll)
+        lr += (-ip.max_roll - roll) * 0.5f;
+    if (roll > ip.force_restore_angle || roll < -ip.force_restore_angle)
+        lr = -roll;
+    else if (pitch > ip.force_restore_angle || pitch < -ip.force_restore_angle)
+        lp = -pitch;
+    float dp1, dr1, dy1;
+    RotSpeed(lr, lp, roll, pitch, yaw, dp1, dr1, dy1);
+
+    out_ang.X = fm_clamp(dr0 + dr1, -500.0f, 500.0f);
+    out_ang.Y = fm_clamp(dp0 + dp1, -500.0f, 500.0f);
+    out_ang.Z = fm_clamp(dy0 + dy1, -500.0f, 500.0f);
+}
+
 // One physics-tick step of Engine:CalculateAddVelocity + Engine:Run (manual flight only).
 // Integrators (RPM, heli lift) scale by dt/BASE_RESOLUTION to match the Lua loop's per-second rate.
 static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, float dt)
@@ -1113,6 +1228,19 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
                 // ChangeVelocity semantics: hold velocity at target every tick (old code re-wrote per frame).
                 physicsData->velocity = fc.velocity;
                 physicsData->angularVelocity = fc.angularVelocity;
+            }
+            else if (fc.mode == 4)
+            {
+                // Native idle hover: the regulator runs here, Lua only refreshes the ground.
+                const IdleParams& ip = g_idle_buf[g_idle_idx.load(std::memory_order_acquire)];
+                RED4ext::Vector3 vel = fc.velocity;
+                RED4ext::Vector3 ang = fc.angularVelocity;
+                if (ip.valid != 0.0f)
+                {
+                    IdleStep(physicsData, ip, vel, ang);
+                }
+                physicsData->velocity = vel;
+                physicsData->angularVelocity = ang;
             }
             else if (fc.mode == 3)
             {
@@ -1636,6 +1764,42 @@ void SetFlightParams3(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFra
     *aOut = 1;
 }
 
+// Phase B-5: push the idle hover reference + gains (game thread; physics hook consumes it).
+// ground_z is the only value that changes often, and "often" is a couple of times a second.
+void SetIdleHoverParams(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+
+    RED4ext::Vector4 a, b, c, d;
+    RED4ext::GetParameter(aFrame, &a);
+    RED4ext::GetParameter(aFrame, &b);
+    RED4ext::GetParameter(aFrame, &c);
+    RED4ext::GetParameter(aFrame, &d);
+    aFrame->code++; // skip ParamEnd
+
+    int next = 1 - g_idle_idx.load(std::memory_order_relaxed);
+    IdleParams& ip = g_idle_buf[next];
+    ip.ground_z = a.X;
+    ip.dest_height = a.Y;
+    ip.damping = a.Z;
+    ip.height_gain = a.W;
+    ip.pitch_band = b.X;
+    ip.roll_band = b.Y;
+    ip.restore_boundary = b.Z;
+    ip.dt_scale = b.W;
+    ip.max_roll = c.X;
+    ip.max_pitch = c.Y;
+    ip.force_restore_angle = c.Z;
+    ip.air_h = c.W;
+    ip.air_v = d.X;
+    ip.idle_gravity = d.Y;
+    ip.max_vz = d.Z;
+    ip.valid = d.W;
+    g_idle_idx.store(next, std::memory_order_release);
+    *aOut = 1;
+}
+
 // Phase B-3: push the per-tick command list (game thread; physics hook consumes it).
 // Packed into 5 Vector4s (few, known-good param types; see SetFlightParams note).
 void SetFlightModel(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
@@ -2059,6 +2223,24 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetFlightParams3()
     cls.RegisterFunction(func);
 }
 
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetIdleHoverParams()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    RED4ext::CBaseFunction::Flags flags = {.isNative = true};
+    auto func =
+        RED4ext::CClassFunction::Create(&cls, "SetIdleHoverParams", "SetIdleHoverParams", &SetIdleHoverParams, {.isNative = true});
+    func->flags = flags;
+    func->SetReturnType("Float");
+    func->AddParam("Vector4", "a");
+    func->AddParam("Vector4", "b");
+    func->AddParam("Vector4", "c");
+    func->AddParam("Vector4", "d");
+    cls.RegisterFunction(func);
+}
+
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetFlightModel()
 {
     auto rtti = RED4ext::CRTTISystem::Get();
@@ -2146,6 +2328,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightParams);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightParams2);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightParams3);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetIdleHoverParams);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightModel);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetNativeRPM);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterDAVHock);
