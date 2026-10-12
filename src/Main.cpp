@@ -31,7 +31,7 @@ static std::atomic<float> g_native_mass{0.0f};
 static std::atomic<float> g_cmd_val[64];
 static std::atomic<uint32_t> g_cmd_seq{0};
 
-// Phase (input): one command edge. id = Def.ActionList value, value = 0/1 or analog magnitude.
+// One command edge. id = Def.ActionList value, value = 0/1 or analog magnitude.
 void SetNativeCommand(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
@@ -560,11 +560,11 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 611586815, ApplyForceAtPosition, RED4ext
     }
 }
 
-// --- Phase B-1/B-2: vehicle physics fixed-update hook (physics thread, once per tick per vehicle) ---
+// --- Vehicle physics fixed-update hook (physics thread, once per tick per vehicle) ---
 static std::atomic<uint32_t> g_hook_thread_id{0};
 
-// Phase C: published by the game-thread game state (declared here because the physics hook reads the
-// ground reference for the idle hover). See DavGameState_OnUpdate near the plugin entry point.
+// Published by the game-thread game state (declared here because the physics hook reads the ground
+// reference for the idle hover). See DavGameState_OnUpdate near the plugin entry point.
 static std::atomic<uint64_t> g_game_frame_count{0};
 static std::atomic<uint32_t> g_game_thread_id{0};
 static std::atomic<float> g_ground_z{0.0f};
@@ -576,7 +576,7 @@ static std::atomic<uint64_t> g_native_phys_enable{0};
 static std::atomic<float> g_native_last_dt{0.0f};
 
 //////////////////////////////////////////////////////////////////////////////////
-// Phase C: the ground raycast, moved out of CET.
+// The ground raycast, moved out of CET.
 //
 // The query is the game's own - the global script function GetSpatialQueriesSystem() and its
 // SyncRaycastByQueryFilter method, which is exactly what Lua was calling. Nothing about the
@@ -888,7 +888,7 @@ struct FlightControlState
     int mode; // 0=off (CET drives), 1=add force/torque, 2=write velocity directly, 3=native flight model
 };
 
-// --- Phase B-3: native flight model (port of Engine:CalculateAddVelocity/Run for manual flight) ---
+// --- Native flight model (port of Engine:CalculateAddVelocity/Run for manual flight) ---
 // Tunables mirror Engine:New + user_setting_table; pushed from Lua (SetFlightParams).
 struct FlightParams
 {
@@ -1002,11 +1002,9 @@ struct FlightTarget
 };
 static FlightTarget g_fm_target = {};
 
-// Phase B-5: native idle hover (Lua mode 4). Engine:CalculateIdleMode used to run in Lua once per
-// Cron tick, and every one of those ticks paid a downward raycast plus several game API calls just
-// to hold a stationary vehicle. Inside the physics hook the velocity, angular velocity, orientation
-// and world position are already in hand, so the same control law runs here for free and Lua only
-// has to refresh the ground reference a couple of times a second.
+// Native idle hover (Lua mode 4). Inside the physics hook the velocity, angular velocity,
+// orientation and world position are already in hand, so the hover control law runs here for free
+// instead of costing Lua a raycast and several game calls on every tick.
 struct IdleParams
 {
     float ground_z;           // world Z of the ground under the AV, pushed by Lua (slow refresh)
@@ -1991,7 +1989,7 @@ void IsOnGround(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, bo
     }
 }
 
-// Phase B-1 probe: lets CET verify the native physics tick hook actually fires.
+// Probe: lets CET verify the native physics tick hook actually fires.
 void GetNativeTickCount(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
@@ -2001,7 +1999,7 @@ void GetNativeTickCount(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aF
     *aOut = (float)g_native_tick_count.load(std::memory_order_relaxed);
 }
 
-// Phase B-2: CET pushes the flight control target; the physics-tick hook applies it every tick.
+// CET pushes the flight control target; the physics-tick hook applies it every tick.
 // mode: 0=off, 1=add force/torque (AddForce semantics), 2=write velocity directly (ChangeVelocity semantics).
 void SetFlightControl(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
@@ -2026,7 +2024,7 @@ void SetFlightControl(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFra
     *aOut = 1;
 }
 
-// Phase B-3: push all flight model tunables (order must match Lua Engine:PushNativeParams).
+// Push all flight model tunables (order must match Lua Engine:PushNativeParams).
 // Params are packed into two Vector4s: CET's native-call path is safest with few, known-good types.
 void SetFlightParams(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
@@ -2061,7 +2059,7 @@ void SetFlightParams(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFram
     *aOut = 1;
 }
 
-// Phase B-3: push helicopter-mode tunables + engine constants (same packing as SetFlightParams).
+// Push helicopter-mode tunables + engine constants (same packing as SetFlightParams).
 void SetFlightParams2(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
@@ -2095,7 +2093,7 @@ void SetFlightParams2(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFra
     *aOut = 1;
 }
 
-// Phase B-3: push attitude-limit constants (same packing as SetFlightParams).
+// Push attitude-limit constants (same packing as SetFlightParams).
 void SetFlightParams3(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
@@ -2117,7 +2115,7 @@ void SetFlightParams3(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFra
     *aOut = 1;
 }
 
-// Phase B-5: push the idle hover reference + gains (game thread; physics hook consumes it).
+// Push the idle hover reference + gains (game thread; physics hook consumes it).
 // ground_z is the only value that changes often, and "often" is a couple of times a second.
 void SetIdleHoverParams(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
@@ -2153,7 +2151,7 @@ void SetIdleHoverParams(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aF
     *aOut = 1;
 }
 
-// Phase B-3: push the per-tick command list (game thread; physics hook consumes it).
+// Push the per-tick command list (game thread; physics hook consumes it).
 // Packed into 5 Vector4s (few, known-good param types; see SetFlightParams note).
 void SetFlightModel(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
@@ -2229,7 +2227,7 @@ void SetFlightModel(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame
     *aOut = 1;
 }
 
-// Phase B-3: read the native RPM integrator for the HUD (same scale as Engine:GetRPMCount).
+// Read the native RPM integrator for the HUD (same scale as Engine:GetRPMCount).
 void GetNativeRPM(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
@@ -2257,7 +2255,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL RegisterFlyAVSystem()
 #endif
 }
 
-// Phase (input): SetNativeCommand native.
+// SetNativeCommand native: one command edge.
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetNativeCommand()
 {
     auto rtti = RED4ext::CRTTISystem::Get();
@@ -2643,13 +2641,12 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterDAVHock()
 }
 
 //////////////////////////////////////////////////////////////////////////////////
-// Phase C: a game-thread per-frame callback.
+// A game-thread per-frame callback.
 //
-// Until now the physics hook was the only place this plugin ran on its own, and it lives on the
-// physics thread: RED4ext::TLS::Get() reads the thread's own TEB slot, so the world pointer is only
-// valid on the game thread, script handles must not be touched here, and a scene query during the
-// step re-enters the physics engine. Anything needing the world, the player, or a raycast therefore
-// fell to CET, polling from Lua.
+// The physics hook lives on the physics thread: RED4ext::TLS::Get() reads the thread's own TEB slot,
+// so the world pointer is only valid on the game thread, script handles must not be touched there,
+// and a scene query during the step re-enters the physics engine. Anything needing the world, the
+// player, or a raycast therefore fell to CET, polling from Lua.
 //
 // RED4ext game states give the missing cadence: OnUpdate runs on the game thread once per frame.
 // The ground reference is published from here, which is what lets Lua stop raycasting for height.
