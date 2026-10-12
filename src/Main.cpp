@@ -561,6 +561,15 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 611586815, ApplyForceAtPosition, RED4ext
 
 // --- Phase B-1/B-2: vehicle physics fixed-update hook (physics thread, once per tick per vehicle) ---
 static std::atomic<uint32_t> g_hook_thread_id{0};
+
+// Phase C: published by the game-thread game state (declared here because the physics hook reads the
+// ground reference for the idle hover). See DavGameState_OnUpdate near the plugin entry point.
+static std::atomic<uint64_t> g_game_frame_count{0};
+static std::atomic<uint32_t> g_game_thread_id{0};
+static std::atomic<float> g_ground_z{0.0f};
+static std::atomic<float> g_ground_valid{0.0f};
+static std::atomic<float> g_av_world_z{0.0f};
+static std::atomic<float> g_av_on_ground{0.0f};
 static std::atomic<uint64_t> g_native_tick_count{0};
 static std::atomic<uint64_t> g_native_phys_enable{0};
 static std::atomic<float> g_native_last_dt{0.0f};
@@ -757,6 +766,20 @@ static void IdleStep(const RED4ext::vehicle::PhysicsData* pd, const IdleParams& 
     out_vel.Z = z;
 
     RED4ext::Quaternion q = pd->orientation;
+    // Same source preference FmStep uses: the transform the game maintains on the entity itself is
+    // what CET's GetEulerAngles reported, and the physics field can lag it. Restoring against a stale
+    // orientation is a good way to lock the vehicle into a tilted pose.
+    const int32_t att_off = g_att_offset.load(std::memory_order_relaxed);
+    if (att_off >= 0 && pd->vehicle != nullptr)
+    {
+        const auto* ent = reinterpret_cast<const RED4ext::Quaternion*>(reinterpret_cast<uintptr_t>(pd->vehicle) +
+                                                                       att_off);
+        const float n2 = ent->i * ent->i + ent->j * ent->j + ent->k * ent->k + ent->r * ent->r;
+        if (std::isfinite(n2) && n2 > 0.9f && n2 < 1.1f)
+        {
+            q = *ent;
+        }
+    }
     const float qn = std::sqrt(q.i * q.i + q.j * q.j + q.k * q.k + q.r * q.r);
     if (qn > 0.0f)
     {
@@ -1231,11 +1254,32 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
             }
             else if (fc.mode == 4)
             {
-                // Native idle hover: the regulator runs here, Lua only refreshes the ground.
-                const IdleParams& ip = g_idle_buf[g_idle_idx.load(std::memory_order_acquire)];
+                // Native idle hover: the regulator runs here, and the ground reference comes from the
+                // game-thread state rather than a Lua raycast.
+                IdleParams ip = g_idle_buf[g_idle_idx.load(std::memory_order_acquire)];
+                if (g_ground_valid.load(std::memory_order_relaxed) != 0.0f)
+                {
+                    // Contact teaches the ground on the game thread; CET only seeds it.
+                    ip.ground_z = g_ground_z.load(std::memory_order_relaxed);
+                }
+                // Engine:CalculateIdleMode skips its altitude term while the vehicle touches
+                // something - that is what lets a landed AV rest instead of being shoved upward. Lua
+                // re-checked IsCollision() every tick; the published contact flag is the same signal,
+                // and without it a settled AV was pinned against whatever it had landed on.
+                if (g_av_on_ground.load(std::memory_order_relaxed) != 0.0f)
+                {
+                    ip.idle_gravity = 0.0f;
+                }
                 RED4ext::Vector3 vel = fc.velocity;
                 RED4ext::Vector3 ang = fc.angularVelocity;
-                if (ip.valid != 0.0f)
+                // A non-zero Lua target means something else is driving the vehicle (a scripted
+                // descent, a command that arrived after the mode push): hold that, do not regulate.
+                const bool idle_target = std::abs(fc.velocity.X) < 0.01f && std::abs(fc.velocity.Y) < 0.01f
+                                         && std::abs(fc.velocity.Z) < 0.01f
+                                         && std::abs(fc.angularVelocity.X) < 0.01f
+                                         && std::abs(fc.angularVelocity.Y) < 0.01f
+                                         && std::abs(fc.angularVelocity.Z) < 0.01f;
+                if (ip.valid != 0.0f && idle_target)
                 {
                     IdleStep(physicsData, ip, vel, ang);
                 }
@@ -1301,6 +1345,10 @@ void SetVehicle(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, fl
         g_fly_vehicle = RED4ext::Handle<RED4ext::vehicle::BaseObject>();
         g_fly_vehicle_raw.store(0, std::memory_order_release);
         g_native_mass.store(0.0f, std::memory_order_relaxed);
+        // A fresh vehicle has no ground history. A stale reference from the previous one would send
+        // the new hover to the wrong altitude, which is what made a spawn lurch before despawning.
+        g_ground_valid.store(0.0f, std::memory_order_relaxed);
+        g_ground_z.store(0.0f, std::memory_order_relaxed);
     }
     is_enable_original_physics = true;
     g_resolve_attempts = 0; // SetVehicle always gets an immediate attempt
@@ -2289,6 +2337,132 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterDAVHock()
 #endif
 }
 
+//////////////////////////////////////////////////////////////////////////////////
+// Phase C: a game-thread per-frame callback.
+//
+// Until now the physics hook was the only place this plugin ran on its own, and it lives on the
+// physics thread: RED4ext::TLS::Get() reads the thread's own TEB slot, so the world pointer is only
+// valid on the game thread, script handles must not be touched here, and a scene query during the
+// step re-enters the physics engine. Anything needing the world, the player, or a raycast therefore
+// fell to CET, polling from Lua.
+//
+// RED4ext game states give the missing cadence: OnUpdate runs on the game thread once per frame.
+// The ground reference is published from here, which is what lets Lua stop raycasting for height.
+// Contact is enough to learn it: while the vehicle touches something, the ground is right under it.
+//////////////////////////////////////////////////////////////////////////////////
+static bool RED4EXT_CALL DavGameState_OnEnter(RED4ext::CGameApplication* aApp)
+{
+    RED4EXT_UNUSED_PARAMETER(aApp);
+    return true;
+}
+
+static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
+{
+    RED4EXT_UNUSED_PARAMETER(aApp);
+    g_game_thread_id.store(static_cast<uint32_t>(GetCurrentThreadId()), std::memory_order_relaxed);
+    const uint64_t n = g_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 && g_sdk)
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "DAV dbg: game state OnUpdate live (tid=%lu, physics tid=%lu)",
+                      (unsigned long)GetCurrentThreadId(), (unsigned long)g_hook_thread_id.load());
+        g_sdk->logger->Info(g_plugin_handle, buf);
+    }
+
+    if (g_fly_vehicle)
+    {
+        static bool s_was_on_ground = false;
+        const bool on_ground = g_fly_vehicle->isOnGround;
+        g_av_on_ground.store(on_ground ? 1.0f : 0.0f, std::memory_order_relaxed);
+        auto* pd = g_fly_vehicle->physicsData;
+        if (pd != nullptr)
+        {
+            const float z = pd->worldPosition.Z;
+            g_av_world_z.store(z, std::memory_order_relaxed);
+            // Learn the ground only on the frame contact starts. Re-learning it on every frame the
+            // vehicle rests on it kept the measured height at zero forever, so the regulator pushed
+            // up, the vehicle left the ground, the stale reference pulled it back down, and the loop
+            // shook the vehicle apart right before a despawn.
+            if (on_ground && !s_was_on_ground)
+            {
+                g_ground_z.store(z, std::memory_order_relaxed);
+                g_ground_valid.store(1.0f, std::memory_order_relaxed);
+            }
+        }
+        s_was_on_ground = on_ground;
+    }
+    return true;
+}
+
+static bool RED4EXT_CALL DavGameState_OnExit(RED4ext::CGameApplication* aApp)
+{
+    RED4EXT_UNUSED_PARAMETER(aApp);
+    return true;
+}
+
+static RED4ext::v0::GameState g_dav_game_state = {
+    &DavGameState_OnEnter,
+    &DavGameState_OnUpdate,
+    &DavGameState_OnExit,
+};
+
+// Seed or correct the ground reference from CET (e.g. right after a spawn, before first contact).
+void SetGroundReference(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+
+    float z;
+    RED4ext::GetParameter(aFrame, &z);
+    aFrame->code++; // skip ParamEnd
+
+    g_ground_z.store(z, std::memory_order_relaxed);
+    g_ground_valid.store(1.0f, std::memory_order_relaxed);
+    *aOut = 1;
+}
+
+// (ground_z, av_z, on_ground, valid) - one call replaces CET's raycast for every height decision.
+void GetGroundInfo(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Vector4* aOut,
+                   int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+
+    *aOut = RED4ext::Vector4{g_ground_z.load(std::memory_order_relaxed),
+                             g_av_world_z.load(std::memory_order_relaxed),
+                             g_av_on_ground.load(std::memory_order_relaxed),
+                             g_ground_valid.load(std::memory_order_relaxed)};
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetGroundReference()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    RED4ext::CBaseFunction::Flags flags = {.isNative = true};
+    auto func =
+        RED4ext::CClassFunction::Create(&cls, "SetGroundReference", "SetGroundReference", &SetGroundReference, {.isNative = true});
+    func->flags = flags;
+    func->SetReturnType("Float");
+    func->AddParam("Float", "z");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetGroundInfo()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    RED4ext::CBaseFunction::Flags flags = {.isNative = true};
+    auto func =
+        RED4ext::CClassFunction::Create(&cls, "GetGroundInfo", "GetGroundInfo", &GetGroundInfo, {.isNative = true});
+    func->flags = flags;
+    func->SetReturnType("Vector4");
+    cls.RegisterFunction(func);
+}
+
 RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::EMainReason aReason,
                                         const RED4ext::Sdk* aSdk)
 {
@@ -2329,6 +2503,10 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightParams2);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightParams3);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetIdleHoverParams);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetGroundInfo);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetGroundReference);
+        // Game-thread cadence: OnUpdate runs once per frame on the game thread.
+        g_sdk->gameStates->Add(aHandle, RED4ext::EGameStateType::Running, &g_dav_game_state);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightModel);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetNativeRPM);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterDAVHock);
