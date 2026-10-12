@@ -604,7 +604,7 @@ struct GroundRayLayout
         kSkip,
     };
 
-    bool probed = false;
+    bool dead = false; // the signature could not be read; retrying will not help
     bool usable = false;
     const char* why = "not probed";
 
@@ -628,6 +628,12 @@ static void ReportGroundRay()
         return;
     }
     g_ray_reported = true;
+    if (!g_ray.usable)
+    {
+        // Every failure that reports is permanent - a missing type or an unreadable signature does not
+        // fix itself between frames. The one retryable case (no world loaded yet) returns silently.
+        g_ray.dead = true;
+    }
     char buf[256];
     std::snprintf(buf, sizeof(buf), "DAV dbg: ground ray %s (%s) params=%d filter=%u m1=%d m2=%d out=%u hit_z=%d",
                   g_ray.usable ? "ready" : "off", g_ray.why, g_ray.param_count, g_ray.filter_size, g_ray.mask1_off,
@@ -678,7 +684,10 @@ static bool ResolveGroundRay()
     {
         return true;
     }
-    g_ray.probed = true;
+    if (g_ray.dead)
+    {
+        return false;
+    }
     auto* rtti = RED4ext::CRTTISystem::Get();
     if (rtti == nullptr)
     {
@@ -2659,7 +2668,7 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
     const uint64_t n = g_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
     // Resolve the query's shape as soon as a world exists, whether or not the vehicle is flying, so
     // the diagnostic lands in the log instead of waiting for someone to take off.
-    if (!g_ray.usable && (n % 30) == 0)
+    if (!g_ray.usable && !g_ray.dead && (n % 30) == 0)
     {
         ResolveGroundRay();
     }
