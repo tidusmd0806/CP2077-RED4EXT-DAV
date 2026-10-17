@@ -24,9 +24,18 @@ static std::atomic<bool> g_shutting_down{false};
 
 // Set while the world is detached (exit movie, save-load teardown). Fires long before OnExit:
 // the game despawns entities and disables their physics first, and our frame clock must not
-// re-enable physics on a vehicle that is being torn down (that fight was the exit hang).
-// Lua's GameObserver.OnDetach/OnAttach drive it; default false so CET reloads keep working.
+// issue synchronous physics queries into that teardown (the confirmed exit hang).
+// Lua drives it from Observe(PlayerPuppet, OnDetach/OnAttach); default false so CET reloads
+// keep working.
 static std::atomic<bool> g_world_gone{false};
+
+// ---- feature gates (exit-hang bisection) ----
+// The ground raycast (a synchronous physics query issued from the game thread) was confirmed as
+// the exit-hang culprit: it deadlocks the physics scene while the world is being destroyed.
+// Both features stay ON; the raycast is stopped early by g_world_gone, which Lua raises from
+// Observe(PlayerPuppet, OnDetach) - that fires before the physics scene is torn down.
+static constexpr bool kExpNoRaycast = false;
+static constexpr bool kExpNoPhysReenable = false;
 
 static bool SafePeekPtr(void* aAddr, void** aOut);
 static bool SafePeekBytes(void* aAddr, void* aDst, size_t aLen);
@@ -618,6 +627,10 @@ static std::atomic<float> g_ground_valid{0.0f};
 static std::atomic<float> g_av_world_z{0.0f};
 static std::atomic<float> g_av_on_ground{0.0f};
 static std::atomic<uint64_t> g_native_tick_count{0};
+// Physics liveness: true while the vehicle's physics step is actually running. Synchronous
+// raycasts are only issued while this is true - querying a scene that is being destroyed is the
+// confirmed exit hang, and teardown always stops physics seconds before the scene dies.
+static std::atomic<bool> g_phys_alive{false};
 static std::atomic<uint64_t> g_native_phys_enable{0};
 static std::atomic<float> g_native_last_dt{0.0f};
 
@@ -3311,6 +3324,12 @@ void SetWorldGone(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, 
     RED4ext::GetParameter(aFrame, &gone);
     aFrame->code++;
     g_world_gone.store(gone != 0.0f, std::memory_order_relaxed);
+    if (g_sdk)
+    {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "DAV dbg: SetWorldGone(%d)", gone != 0.0f ? 1 : 0);
+        g_sdk->logger->Info(g_plugin_handle, buf);
+    }
     *aOut = 1.0f;
 }
 
@@ -3408,7 +3427,10 @@ static void MonitorTick(float aDt)
         // the smoothest Lua update the DLL can feed Lua.
         float gz = 0.0f;
         float height = -1.0f;
-        const bool ray_ok = RaycastGroundZ(avx, avy, avz + g_query_offset.load(std::memory_order_relaxed),
+        // Only query while physics is stepping (see g_phys_alive): during pause or world
+        // teardown the scene is frozen or dying and a sync raycast there deadlocks teardown.
+        const bool ray_ok = g_phys_alive.load(std::memory_order_relaxed) &&
+                            RaycastGroundZ(avx, avy, avz + g_query_offset.load(std::memory_order_relaxed),
                                            g_query_distance.load(std::memory_order_relaxed), &gz);
         if (ray_ok)
             height = avz - gz;
@@ -3775,14 +3797,15 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
     const uint64_t n = g_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
     // Resolve the query's shape as soon as a world exists, whether or not the vehicle is flying, so
     // the diagnostic lands in the log instead of waiting for someone to take off.
-    if (!g_ray.usable && !g_ray.dead && (n % 30) == 0)
+    if (!kExpNoRaycast && !g_ray.usable && !g_ray.dead && (n % 30) == 0)
     {
         ResolveGroundRay();
     }
     if (n == 1 && g_sdk)
     {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: game state OnUpdate live (tid=%lu, physics tid=%lu)",
+        std::snprintf(buf, sizeof(buf), "DAV dbg: game state OnUpdate live (raycast=%d physre=%d, tid=%lu, physics tid=%lu)",
+                      kExpNoRaycast ? 0 : 1, kExpNoPhysReenable ? 0 : 1,
                       (unsigned long)GetCurrentThreadId(), (unsigned long)g_hook_thread_id.load());
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
@@ -3816,7 +3839,8 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
                               (int)g_fly_vehicle->physicsState);
                 g_sdk->logger->Info(g_plugin_handle, pbuf);
             }
-            g_fly_vehicle->ForceEnablePhysics();
+            if (!kExpNoPhysReenable)
+                g_fly_vehicle->ForceEnablePhysics();
         }
         static bool s_was_on_ground = false;
         const bool on_ground = g_fly_vehicle->isOnGround;
@@ -3841,7 +3865,7 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
             // landed too keeps the published value honest and makes the whole path observable from
             // the probe without anyone having to take off. A miss leaves the last known ground alone.
             const bool hover_active = (g_fc_buf[g_fc_idx.load(std::memory_order_acquire)].mode == 4);
-            if (hover_active && (n % 30) == 0)
+            if (hover_active && g_phys_alive.load(std::memory_order_relaxed) && (n % 30) == 0)
             {
                 float gz = 0.0f;
                 if (RaycastGroundZ(pd->worldPosition.X, pd->worldPosition.Y, z + g_query_offset.load(std::memory_order_relaxed),
@@ -3853,6 +3877,25 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
             }
         }
         s_was_on_ground = on_ground;
+    }
+    // Physics liveness: the hook ticks once per physics step of our vehicle. Ticks advancing
+    // means the physics scene is alive and cycling; no ticks for ~0.25s means physics is paused
+    // (menu, parked vehicle) or the world is being torn down. The exit flow pauses the world
+    // seconds before detaching it, so raycasts are off long before the scene starts dying.
+    {
+        static uint64_t s_phys_last_ticks = 0;
+        static int s_phys_dead_frames = 0;
+        const uint64_t t = g_native_tick_count.load(std::memory_order_relaxed);
+        if (t != s_phys_last_ticks)
+        {
+            s_phys_last_ticks = t;
+            s_phys_dead_frames = 0;
+            g_phys_alive.store(true, std::memory_order_relaxed);
+        }
+        else if (++s_phys_dead_frames >= 15)
+        {
+            g_phys_alive.store(false, std::memory_order_relaxed);
+        }
     }
     // Stall probe: if the physics hook stops running for our vehicle (park/dismount states), every
     // mode push is silently dropped. Warn once per stall so the recall bug can be pinned down.
@@ -3895,7 +3938,7 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
         ThrusterTick(dt);
         SoundEdgeTick(dt);
         // Threshold monitor: height / player distance / entry-area edges announced as events.
-        if (g_mon_mask.load(std::memory_order_relaxed) != 0)
+        if (!kExpNoRaycast && g_mon_mask.load(std::memory_order_relaxed) != 0)
             MonitorTick(dt);
     }
     // MUST return false: RED4ext treats a state's OnUpdate returning true as "finished" and stops
