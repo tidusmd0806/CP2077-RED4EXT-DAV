@@ -33,7 +33,9 @@ static std::atomic<float> g_native_mass{0.0f};
 static std::atomic<float> g_cmd_val[64];
 
 // Flight context bits for the auto mode re-assert in the physics hook: bit0 = player aboard,
-// bit1 = autopilot engaged. Lua pushes on situation/autopilot transitions.
+// bit1 = autopilot engaged, bit2 = helicopter flight mode (mode 2 velocity hold IS the normal
+// manual control there, so the re-assert must never touch it). Lua pushes on situation and
+// autopilot transitions.
 static std::atomic<int32_t> g_flight_flags{0};
 
 // Any held command non-zero? (the successor to Lua's per-input mode 3 re-assert edge).
@@ -1592,7 +1594,9 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
             if ((fc.mode == 2 || fc.mode == 4) && HeldCommandActive())
             {
                 const int32_t flags = g_flight_flags.load(std::memory_order_relaxed);
-                if ((flags & 1) != 0 && (flags & 2) == 0)
+                // bit2: helicopter mode drives manual flight through mode 2 velocity targets; the
+                // mode 3 re-assert is an airplane-only rescue and would freeze every heli input.
+                if ((flags & 1) != 0 && (flags & 2) == 0 && (flags & 4) == 0)
                 {
                     fc.mode = 3;
                     fc.velocity = RED4ext::Vector3{0, 0, 0};
