@@ -31,6 +31,21 @@ static std::atomic<float> g_native_mass{0.0f};
 // holds it, so the control loop no longer re-sends the whole list at 20 Hz. Index = Def.ActionList + 1
 // (Idle = -1). Shadow mode first: compared against the list SetFlightModel pushes.
 static std::atomic<float> g_cmd_val[64];
+
+// Flight context bits for the auto mode re-assert in the physics hook: bit0 = player aboard,
+// bit1 = autopilot engaged. Lua pushes on situation/autopilot transitions.
+static std::atomic<int32_t> g_flight_flags{0};
+
+// Any held command non-zero? (the successor to Lua's per-input mode 3 re-assert edge).
+static bool HeldCommandActive()
+{
+    for (int i = 0; i < 64; ++i)
+    {
+        if (g_cmd_val[i].load(std::memory_order_relaxed) != 0.0f)
+            return true;
+    }
+    return false;
+}
 static std::atomic<uint32_t> g_cmd_seq{0};
 
 // One command edge. id = Def.ActionList value, value = 0/1 or analog magnitude.
@@ -1547,7 +1562,27 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
                 physicsData->unk1B0 = g_gravity_enable.load(std::memory_order_relaxed) ? 1 : 0;
             }
             g_native_gravity.store(physicsData->unk1B0, std::memory_order_relaxed);
-            const FlightControlState& fc = g_fc_buf[g_fc_idx.load(std::memory_order_acquire)];
+            FlightControlState fc = g_fc_buf[g_fc_idx.load(std::memory_order_acquire)];
+            // Phase 5 auto re-assert: Lua's per-input mode 3 re-assert (the AV:Operate shim) is
+            // gone. With a driver aboard, no autopilot, and any held command non-zero, the flight
+            // model must run regardless of the last mode Lua pushed - landing with throttle held
+            // means takeoff intent, exactly the old shim's semantics.
+            if ((fc.mode == 2 || fc.mode == 4) && HeldCommandActive())
+            {
+                const int32_t flags = g_flight_flags.load(std::memory_order_relaxed);
+                if ((flags & 1) != 0 && (flags & 2) == 0)
+                {
+                    fc.mode = 3;
+                    fc.velocity = RED4ext::Vector3{0, 0, 0};
+                    fc.angularVelocity = RED4ext::Vector3{0, 0, 0};
+                    // Persist so the game-thread views (idle flag, heartbeat) match what the hook
+                    // actually runs; Lua's next SetFlightControl overwrites this as usual.
+                    FlightControlState& w = g_fc_buf[g_fc_idx.load(std::memory_order_acquire)];
+                    w.mode = 3;
+                    w.velocity = RED4ext::Vector3{0, 0, 0};
+                    w.angularVelocity = RED4ext::Vector3{0, 0, 0};
+                }
+            }
             if ((dbg_n % 240) == 120 && g_sdk)
             {
                 // Heartbeat: proves the hook keeps running for our vehicle (dismount/park states were
@@ -2024,6 +2059,20 @@ void GetNativeTickCount(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aF
 
 // CET pushes the flight control target; the physics-tick hook applies it every tick.
 // mode: 0=off, 1=add force/torque (AddForce semantics), 2=write velocity directly (ChangeVelocity semantics).
+// Push the flight context bits (bit0 = player aboard, bit1 = autopilot) that gate the physics
+// hook's auto mode re-assert. The hook must not run the flight model without a driver aboard
+// (the mode 4 idle hover lives outside the vehicle), and must not fight the autopilot.
+void SetFlightFlags(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t flags = 0;
+    RED4ext::GetParameter(aFrame, &flags);
+    aFrame->code++;
+    g_flight_flags.store(flags, std::memory_order_relaxed);
+    *aOut = 1.0f;
+}
+
 void SetFlightControl(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
@@ -2527,6 +2576,20 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetNativeTickCount()
         RED4ext::CClassFunction::Create(&cls, "GetNativeTickCount", "GetNativeTickCount", &GetNativeTickCount, {.isNative = true});
     func->flags = flags;
     func->SetReturnType("Float");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetFlightFlags()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    auto func = RED4ext::CClassFunction::Create(&cls, "SetFlightFlags", "SetFlightFlags", &SetFlightFlags,
+                                                {.isNative = true});
+    func->flags = RED4ext::CBaseFunction::Flags{.isNative = true};
+    func->SetReturnType("Float");
+    func->AddParam("Int32", "flags");
     cls.RegisterFunction(func);
 }
 
@@ -3215,7 +3278,14 @@ static bool HeldAny(const std::vector<int32_t>& aIds)
 // Codes: 1 accel start, 2 accel stop, 3 thruster start, 4 thruster stop.
 static void SoundEdgeTick(float aDt)
 {
-    if (HeldAny(g_snd_accel_ids))
+    // Manual input only - the same gate as the flight auto re-assert. While the autopilot is
+    // engaged, manual held commands must not start the acceleration layer (the input itself is
+    // ignored, but the sound used to blip anyway); an already-running layer fades out through the
+    // grace timer. The aboard bit matters too: outside the vehicle the held state can carry stale
+    // presses, and the old Lua path only dispatched sound from the in-vehicle Operate.
+    const int32_t flags = g_flight_flags.load(std::memory_order_relaxed);
+    const bool manual = (flags & 1) != 0 && (flags & 2) == 0;
+    if (manual && HeldAny(g_snd_accel_ids))
     {
         g_snd_accel_idle = 0.0f;
         if (!g_snd_accel_on)
@@ -3233,7 +3303,7 @@ static void SoundEdgeTick(float aDt)
             DispatchSndEdge(2);
         }
     }
-    if (HeldAny(g_snd_thr_ids))
+    if (manual && HeldAny(g_snd_thr_ids))
     {
         g_snd_thr_idle = 0.0f;
         if (!g_snd_thr_on)
@@ -3692,6 +3762,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterUnsetPhysicsState);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterIsOnGround);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetNativeTickCount);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightFlags);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightControl);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightParams);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightParams2);
