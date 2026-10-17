@@ -18,6 +18,27 @@ static bool is_enable_original_physics = true;
 static RED4ext::Handle<RED4ext::vehicle::BaseObject> g_fly_vehicle;
 static uint64_t g_fly_vehicle_entity_id_hash = 0;
 
+// Set when the Running game state is exited (quit to desktop). The frame clock stops touching the
+// world from that point on; see DavGameState_OnExit.
+static std::atomic<bool> g_shutting_down{false};
+
+static bool SafePeekPtr(void* aAddr, void** aOut);
+static bool SafePeekBytes(void* aAddr, void* aDst, size_t aLen);
+
+// Shutdown etiquette: on quit the world teardown frees the vehicle entity while our handle still
+// points at it (Lua never runs SetVehicle(0) on exit). Every native getter and the frame clock
+// must pass through this before reading the body: a dangling read faults into the SEH filter and
+// reports "body gone" instead of taking the process down. Same-thread callers (Lua natives and
+// the game-thread OnUpdate) can use this as a check-then-read; the physics thread has its own
+// SEH-wrapped access inside the hook.
+static bool VehicleBodyAlive()
+{
+    if (g_fly_vehicle.instance == nullptr)
+        return false;
+    void* pd = nullptr;
+    return SafePeekPtr(&g_fly_vehicle.instance->physicsData, &pd);
+}
+
 static const RED4ext::Sdk* g_sdk = nullptr;
 static RED4ext::PluginHandle g_plugin_handle = 0;
 static uint32_t g_resolve_attempts = 0;
@@ -1781,7 +1802,7 @@ void GetMass(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float
     *aOut = 0;
 
     TryResolveVehicle("GetMass");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         *aOut = g_fly_vehicle->physicsData->total_mass;
     }
@@ -1801,7 +1822,7 @@ void HasGravity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, bo
     *aOut = false;
 
     TryResolveVehicle("HasGravity");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         *aOut = g_fly_vehicle->physicsData->unk1B0 != 0;
     }
@@ -1828,7 +1849,7 @@ void EnableGravity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame,
     *aOut = 0;
 
     TryResolveVehicle("EnableGravity");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         g_fly_vehicle->physicsData->unk1B0 = is_enable;
         *aOut = 1;
@@ -1850,7 +1871,7 @@ void AddVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, f
     *aOut = 0;
 
     TryResolveVehicle("AddVelocity");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         g_fly_vehicle->physicsData->velocity += velocity;
         g_fly_vehicle->physicsData->angularVelocity += angularVelocity;
@@ -1873,7 +1894,7 @@ void AddForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, floa
     *aOut = 0;
 
     TryResolveVehicle("AddForce");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         g_fly_vehicle->physicsData->force += force;
         g_fly_vehicle->physicsData->torque += torque;
@@ -1899,7 +1920,7 @@ void ChangeVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame
     *aOut = 0;
 
     TryResolveVehicle("ChangeVelocity");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         if (switchIndex == 1)
         {
@@ -1931,7 +1952,7 @@ void ChangeForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, f
     aFrame->code++; // skip ParamEnd
     *aOut = 0;
     TryResolveVehicle("ChangeForce");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         if (switchIndex == 1)
         {
@@ -1964,7 +1985,7 @@ void GetVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, R
     *aOut = velocity;
 
     TryResolveVehicle("GetVelocity");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         *aOut = g_fly_vehicle->physicsData->velocity;
     }
@@ -1985,7 +2006,7 @@ void GetAngularVelocity(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aF
     *aOut = angularVelocity;
 
     TryResolveVehicle("GetAngularVelocity");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         *aOut = g_fly_vehicle->physicsData->angularVelocity;
     }
@@ -2003,7 +2024,7 @@ void GetForce(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4
     force.Z = 0;
     *aOut = force;
     TryResolveVehicle("GetForce");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         *aOut = g_fly_vehicle->physicsData->force;
     }
@@ -2021,7 +2042,7 @@ void GetTorque(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED
     torque.Z = 0;
     *aOut = torque;
     TryResolveVehicle("GetTorque");
-    if (g_fly_vehicle && g_fly_vehicle->physicsData)
+    if (VehicleBodyAlive() && g_fly_vehicle->physicsData)
     {
         *aOut = g_fly_vehicle->physicsData->torque;
     }
@@ -2036,7 +2057,7 @@ void GetPhysicsState(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFram
     *aOut = -1;
 
     TryResolveVehicle("GetPhysicsState");
-    if (g_fly_vehicle)
+    if (VehicleBodyAlive())
     {
         *aOut = g_fly_vehicle->physicsState;
     }
@@ -2051,7 +2072,7 @@ void UnsetPhysicsState(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFr
     *aOut = -1;
 
     TryResolveVehicle("UnsetPhysicsState");
-    if (g_fly_vehicle)
+    if (VehicleBodyAlive())
     {
         g_fly_vehicle->ForceEnablePhysics();
         *aOut = 1;
@@ -2067,7 +2088,7 @@ void IsOnGround(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, bo
     *aOut = false;
 
     TryResolveVehicle("IsOnGround");
-    if (g_fly_vehicle)
+    if (VehicleBodyAlive())
     {
         *aOut = g_fly_vehicle->isOnGround;
     }
@@ -3324,6 +3345,11 @@ static void MonitorTick(float aDt)
     static int s_entry_state = 0;  // +1 in, -1 out
     static float s_keepalive_accum = 0.0f;
 
+    // The exit movie runs unthrottled (hundreds of fps once the world is gone). Below a sane
+    // gameplay frame time the monitor has nothing useful to measure anyway.
+    if (aDt < 1.0f / 240.0f)
+        return;
+
     if (mask == 0)
     {
         s_height_state = 0;
@@ -3332,7 +3358,7 @@ static void MonitorTick(float aDt)
         s_keepalive_accum = 0.0f;
         return;
     }
-    if (g_fly_vehicle.instance == nullptr || g_fly_vehicle->physicsData == nullptr)
+    if (!VehicleBodyAlive())
         return;
     auto* pd = g_fly_vehicle->physicsData;
     const float avx = pd->worldPosition.X;
@@ -3684,6 +3710,11 @@ static bool RED4EXT_CALL DavGameState_OnEnter(RED4ext::CGameApplication* aApp)
 static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
 {
     RED4EXT_UNUSED_PARAMETER(aApp);
+    // Quit to desktop: once the Running state is exiting, the world is going away under us. Do
+    // nothing at all - the exit movie runs hundreds of frames per second and every world touch
+    // there is a use-after-free waiting to happen.
+    if (g_shutting_down.load(std::memory_order_relaxed))
+        return false;
     g_game_thread_id.store(static_cast<uint32_t>(GetCurrentThreadId()), std::memory_order_relaxed);
     const uint64_t n = g_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
     // Resolve the query's shape as soon as a world exists, whether or not the vehicle is flying, so
@@ -3704,12 +3735,12 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
         // Heartbeat proving OnUpdate (and therefore ThrusterTick/SoundEdgeTick) still runs; also
         // samples the physics state so a game-side disable becomes visible in the log.
         char buf[96];
-        const int phys = g_fly_vehicle ? (int)g_fly_vehicle->physicsState : -1;
+        const int phys = VehicleBodyAlive() ? (int)g_fly_vehicle->physicsState : -1;
         std::snprintf(buf, sizeof(buf), "DAV dbg: OnUpdate heartbeat #%llu phys=%d", (unsigned long long)n, phys);
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
 
-    if (g_fly_vehicle)
+    if (VehicleBodyAlive())
     {
         // The game disables physics (physicsState != 0) when the AV lands or touches something
         // after dismount. A disabled body is never simulated, so the physics hook stops running
@@ -3780,7 +3811,7 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
             {
                 char sbuf[160];
                 std::snprintf(sbuf, sizeof(sbuf), "DAV dbg: hook stalled - no physics ticks for ~3s (phys=%d)",
-                              g_fly_vehicle ? (int)g_fly_vehicle->physicsState : -1);
+                              VehicleBodyAlive() ? (int)g_fly_vehicle->physicsState : -1);
                 g_sdk->logger->Info(g_plugin_handle, sbuf);
             }
         }
@@ -3820,6 +3851,14 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
 static bool RED4EXT_CALL DavGameState_OnExit(RED4ext::CGameApplication* aApp)
 {
     RED4EXT_UNUSED_PARAMETER(aApp);
+    // Shutdown etiquette: this fires when the Running state pops (quit to desktop). The teardown
+    // that follows frees the vehicle entity while our handle still points at it, so drop every
+    // piece of world state the frame clock touches. Lua's despawn path (SetVehicle(0)) never runs
+    // on a quit; this is the only reliable place to let go.
+    g_shutting_down.store(true, std::memory_order_relaxed);
+    g_mon_mask.store(0, std::memory_order_relaxed);
+    g_fly_vehicle = RED4ext::Handle<RED4ext::vehicle::BaseObject>();
+    g_fly_vehicle_entity_id_hash = 0;
     return true;
 }
 
