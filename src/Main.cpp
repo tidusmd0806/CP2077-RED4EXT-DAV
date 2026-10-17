@@ -22,6 +22,12 @@ static uint64_t g_fly_vehicle_entity_id_hash = 0;
 // world from that point on; see DavGameState_OnExit.
 static std::atomic<bool> g_shutting_down{false};
 
+// Set while the world is detached (exit movie, save-load teardown). Fires long before OnExit:
+// the game despawns entities and disables their physics first, and our frame clock must not
+// re-enable physics on a vehicle that is being torn down (that fight was the exit hang).
+// Lua's GameObserver.OnDetach/OnAttach drive it; default false so CET reloads keep working.
+static std::atomic<bool> g_world_gone{false};
+
 static bool SafePeekPtr(void* aAddr, void** aOut);
 static bool SafePeekBytes(void* aAddr, void* aDst, size_t aLen);
 
@@ -2629,6 +2635,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetNativeTickCount()
 // Defined further down with the threshold monitor code.
 void SetThresholds(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4);
 void SetLandingVFX(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4);
+void SetWorldGone(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4);
 
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetThresholds()
 {
@@ -2661,6 +2668,20 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetLandingVFX()
     func->SetReturnType("Float");
     func->AddParam("Float", "enabled");
     func->AddParam("Vector4", "offset");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetWorldGone()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    auto func = RED4ext::CClassFunction::Create(&cls, "SetWorldGone", "SetWorldGone", &SetWorldGone,
+                                                {.isNative = true});
+    func->flags = RED4ext::CBaseFunction::Flags{.isNative = true};
+    func->SetReturnType("Float");
+    func->AddParam("Float", "gone");
     cls.RegisterFunction(func);
 }
 
@@ -3084,6 +3105,11 @@ static uint32_t SafeTypeSize(const RED4ext::CBaseRTTIType* aType)
 // in this float - the Lua side reads event.timeToLive back (see OnDavThresholdEvent).
 static void QueueDavEvent(const char* aClassName, const char* aEventName, float aTtl = 1.5f)
 {
+    // Exit etiquette: once the Running state is exiting, stop feeding the game's event dispatch.
+    // Events queued into a teardown in progress are processed by game code that no longer has the
+    // puppet or the script domain behind them - our SEH guards cannot see that deferred crash.
+    if (g_shutting_down.load(std::memory_order_relaxed))
+        return;
     const char* fail = nullptr;
     auto* rtti = RED4ext::CRTTISystem::Get();
     RED4ext::IScriptable* player = nullptr;
@@ -3277,6 +3303,17 @@ void SetLandingVFX(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame,
     *aOut = 1.0f;
 }
 
+void SetWorldGone(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    float gone = 0.0f;
+    RED4ext::GetParameter(aFrame, &gone);
+    aFrame->code++;
+    g_world_gone.store(gone != 0.0f, std::memory_order_relaxed);
+    *aOut = 1.0f;
+}
+
 static bool SafePeekBytes(void* aAddr, void* aDst, size_t aLen)
 {
     __try
@@ -3391,10 +3428,24 @@ static void MonitorTick(float aDt)
                               height);
             }
             // The VFX slot position lives in Lua (it has a proven component handle there).
-            // While inside the warning zone the DLL re-fires a tick every frame that carries
-            // the fresh height in timeToLive, so Lua re-projects the VFX without polling.
+            // While inside the warning zone the DLL re-fires a tick carrying the fresh height in
+            // timeToLive, so Lua re-projects the VFX without polling. The tick only needs to fire
+            // when the VFX actually moves: descending changes the height by more than the deadband
+            // every frame (tracking stays per-frame), while a stationary hover would otherwise
+            // push 60 events+VM dispatches+Lua calls per second - and that event storm was the
+            // prime suspect once quit-to-desktop crashes started correlating with the VFX work.
             if (s_height_state == -1 && g_vfx_enabled.load(std::memory_order_relaxed) != 0.0f)
-                QueueDavEvent("gameActionEvent", "dav_evt_height_tick", height);
+            {
+                static float s_last_tick_height = 1e9f;
+                static float s_vfx_tick_hold = 0.0f;
+                s_vfx_tick_hold += aDt;
+                if (std::abs(height - s_last_tick_height) > 0.01f || s_vfx_tick_hold >= 0.25f)
+                {
+                    s_last_tick_height = height;
+                    s_vfx_tick_hold = 0.0f;
+                    QueueDavEvent("gameActionEvent", "dav_evt_height_tick", height);
+                }
+            }
         }
     }
 
@@ -3715,6 +3766,11 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
     // there is a use-after-free waiting to happen.
     if (g_shutting_down.load(std::memory_order_relaxed))
         return false;
+    // World detached (exit movie or save teardown): the game is despawning entities and disabling
+    // their physics right now. Re-enabling physics on a dying vehicle was the exit hang - Lua's
+    // GameObserver.OnDetach raises this flag long before OnExit fires.
+    if (g_world_gone.load(std::memory_order_relaxed))
+        return false;
     g_game_thread_id.store(static_cast<uint32_t>(GetCurrentThreadId()), std::memory_order_relaxed);
     const uint64_t n = g_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
     // Resolve the query's shape as soon as a world exists, whether or not the vehicle is flying, so
@@ -3859,6 +3915,8 @@ static bool RED4EXT_CALL DavGameState_OnExit(RED4ext::CGameApplication* aApp)
     g_mon_mask.store(0, std::memory_order_relaxed);
     g_fly_vehicle = RED4ext::Handle<RED4ext::vehicle::BaseObject>();
     g_fly_vehicle_entity_id_hash = 0;
+    if (g_sdk)
+        g_sdk->logger->Info(g_plugin_handle, "DAV dbg: game state OnExit (shutdown guard armed)");
     return true;
 }
 
