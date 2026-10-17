@@ -22,30 +22,15 @@ static uint64_t g_fly_vehicle_entity_id_hash = 0;
 // world from that point on; see DavGameState_OnExit.
 static std::atomic<bool> g_shutting_down{false};
 
-// Set while the world is detached (exit movie, save-load teardown). Fires long before OnExit:
-// the game despawns entities and disables their physics first, and our frame clock must not
-// issue synchronous physics queries into that teardown (the confirmed exit hang).
-// Lua drives it from Observe(PlayerPuppet, OnDetach/OnAttach); default false so CET reloads
-// keep working.
+// Set while the world is detached (SetWorldGone); blocks synchronous physics queries during teardown.
 static std::atomic<bool> g_world_gone{false};
-
-// ---- feature gates (exit-hang bisection) ----
-// The ground raycast (a synchronous physics query issued from the game thread) was confirmed as
-// the exit-hang culprit: it deadlocks the physics scene while the world is being destroyed.
-// Both features stay ON; the raycast is stopped early by g_world_gone, which Lua raises from
-// Observe(PlayerPuppet, OnDetach) - that fires before the physics scene is torn down.
-static constexpr bool kExpNoRaycast = false;
-static constexpr bool kExpNoPhysReenable = false;
 
 static bool SafePeekPtr(void* aAddr, void** aOut);
 static bool SafePeekBytes(void* aAddr, void* aDst, size_t aLen);
 
-// Shutdown etiquette: on quit the world teardown frees the vehicle entity while our handle still
-// points at it (Lua never runs SetVehicle(0) on exit). Every native getter and the frame clock
-// must pass through this before reading the body: a dangling read faults into the SEH filter and
-// reports "body gone" instead of taking the process down. Same-thread callers (Lua natives and
-// the game-thread OnUpdate) can use this as a check-then-read; the physics thread has its own
-// SEH-wrapped access inside the hook.
+// True while the bound vehicle body is safely readable. All getters and the frame clock gate on
+// this: quit frees the entity while our handle still points at it, and the SEH probe turns a
+// dangling read into "body gone" instead of a crash.
 static bool VehicleBodyAlive()
 {
     if (g_fly_vehicle.instance == nullptr)
@@ -63,15 +48,12 @@ static uint32_t g_resolve_attempts = 0;
 static std::atomic<uint64_t> g_fly_vehicle_raw{0};
 static std::atomic<float> g_native_mass{0.0f};
 
-// --- Event-driven command state. Lua pushes (action, value) on press/release/axis-change and the DLL
-// holds it, so the control loop no longer re-sends the whole list at 20 Hz. Index = Def.ActionList + 1
-// (Idle = -1). Shadow mode first: compared against the list SetFlightModel pushes.
+// Event-driven command state: Lua pushes (action, value) on press/release; the DLL holds it.
+// Index = Def.ActionList + 1 (Idle = -1).
 static std::atomic<float> g_cmd_val[64];
 
-// Flight context bits for the auto mode re-assert in the physics hook: bit0 = player aboard,
-// bit1 = autopilot engaged, bit2 = helicopter flight mode (mode 2 velocity hold IS the normal
-// manual control there, so the re-assert must never touch it). Lua pushes on situation and
-// autopilot transitions.
+// Flight context bits for the auto mode re-assert: bit0 aboard, bit1 autopilot, bit2 heli mode
+// (mode 2 velocity hold is normal manual control there, so the re-assert must skip it).
 static std::atomic<int32_t> g_flight_flags{0};
 
 // Any held command non-zero? (the successor to Lua's per-input mode 3 re-assert edge).
@@ -178,17 +160,15 @@ static void ResolveEntityTransformOffsets()
     if (g_sdk)
     {
         char buf[160];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: transform offsets orientation=%d position=%d classes=%d props=%u", att,
+        std::snprintf(buf, sizeof(buf), "transform offsets orientation=%d position=%d classes=%d props=%u", att,
                       pos, found_classes, last_props);
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
 }
 
-// vehicle::BaseObject stores the entity transform directly (see vehicleBaseObject.hpp):
-//   physics @0x2C8, physicsData @0x2D0, curveSetData @0x2D8, chassis @0x2E8, unk2F8[16] @0x2F8,
-//   chassisType @0x338, worldTransform @0x340 (WorldTransform = Position @0x00, Orientation @0x10),
-//   unk360 @0x360 -- the arithmetic closes, so the offsets are not guesses.
-// The game writes this same field in vehicleBaseObject sub_280 ("applies worldTransform to ... this->worldTransform").
+// vehicle::BaseObject stores the entity transform directly (C++-only members, no RTTI property):
+// worldTransform @0x340 (position @0x00, orientation @0x10); offsets verified against the game's
+// own write in vehicleBaseObject sub_280.
 constexpr int32_t kVehicleWorldTransform = 0x340;
 constexpr int32_t kVehicleWorldOrientation = 0x350;
 
@@ -200,7 +180,7 @@ static void UseFixedTransformOffsets()
     g_att_offset.store(kVehicleWorldOrientation, std::memory_order_relaxed);
     g_wpos_offset.store(kVehicleWorldTransform, std::memory_order_relaxed);
     if (g_sdk)
-        g_sdk->logger->Info(g_plugin_handle, "DAV dbg: transform offsets from vehicleBaseObject: orientation=0x350 position=0x340");
+        g_sdk->logger->Info(g_plugin_handle, "transform offsets from vehicleBaseObject: orientation=0x350 position=0x340");
 }
 
 // Stage 0b: RTTI does not expose the entity transform, so locate the orientation field empirically
@@ -283,7 +263,7 @@ static bool FindVehicleByHash(uint64_t aHash, RED4ext::Handle<RED4ext::vehicle::
     {
         s_signature_logged = true;
         char buf[192];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: FindEntityByID params=%u ret=%s", func->params.size,
+        std::snprintf(buf, sizeof(buf), "FindEntityByID params=%u ret=%s", func->params.size,
                       (func->returnType && func->returnType->type) ? func->returnType->type->GetName().ToString()
                                                                    : "?");
         g_sdk->logger->Info(g_plugin_handle, buf);
@@ -312,7 +292,7 @@ static bool FindVehicleByHash(uint64_t aHash, RED4ext::Handle<RED4ext::vehicle::
             if (g_sdk)
             {
                 char buf[192];
-                std::snprintf(buf, sizeof(buf), "DAV dbg: FindEntityByID param %u type=%s", i,
+                std::snprintf(buf, sizeof(buf), "FindEntityByID param %u type=%s", i,
                               (prop && prop->type) ? prop->type->GetName().ToString() : "?");
                 g_sdk->logger->Error(g_plugin_handle, buf);
             }
@@ -358,7 +338,7 @@ static bool TryResolveVehicle(const char* aReason)
             reinterpret_cast<RED4ext::vehicle::BaseObject*>(raw));
         if (g_sdk)
         {
-            g_sdk->logger->Info(g_plugin_handle, "DAV dbg: vehicle adopted from physics hook");
+            g_sdk->logger->Info(g_plugin_handle, "vehicle adopted from physics hook");
         }
         return true;
     }
@@ -385,7 +365,7 @@ static bool TryResolveVehicle(const char* aReason)
         found = FindVehicleByHash(local_only, handle, &why);
         if (found && g_sdk)
         {
-            g_sdk->logger->Info(g_plugin_handle, "DAV dbg: vehicle found via local-only id (serial dropped)");
+            g_sdk->logger->Info(g_plugin_handle, "vehicle found via local-only id (serial dropped)");
         }
     }
 
@@ -394,7 +374,7 @@ static bool TryResolveVehicle(const char* aReason)
         if (g_sdk && g_resolve_attempts <= 32)
         {
             char buf[192];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: FindEntityByID miss (%s) hash=%llu", why,
+            std::snprintf(buf, sizeof(buf), "FindEntityByID miss (%s) hash=%llu", why,
                           (unsigned long long)full_hash);
             g_sdk->logger->Info(g_plugin_handle, buf);
         }
@@ -410,7 +390,7 @@ static bool TryResolveVehicle(const char* aReason)
             (g_fly_vehicle.instance && g_fly_vehicle.instance->GetType())
                 ? g_fly_vehicle.instance->GetType()->GetName().ToString()
                 : "?";
-        std::snprintf(buf, sizeof(buf), "DAV dbg: vehicle resolved by '%s' hash=%llu class=%s physdata=%d mass=%.0f",
+        std::snprintf(buf, sizeof(buf), "vehicle resolved by '%s' hash=%llu class=%s physdata=%d mass=%.0f",
                       aReason ? aReason : "?", (unsigned long long)full_hash, cls_name,
                       (g_fly_vehicle.instance && g_fly_vehicle->physicsData) ? 1 : 0,
                       (g_fly_vehicle.instance && g_fly_vehicle->physicsData) ? g_fly_vehicle->physicsData->total_mass
@@ -420,10 +400,8 @@ static bool TryResolveVehicle(const char* aReason)
     return true;
 }
 
-//////////////////////////////////////////////////////////////////////
-// In this area, class names and macro names have been changed based on Jackhambert's code.
+// Class/macro names adapted from Jackhumbert's let_there_be_flight:
 // https://github.com/jackhumbert/let_there_be_flight/blob/main/src/red4ext/Utils/FlightModule.hpp
-////////
 
 #ifdef FLY_TANK_MOD
 struct FlyTankModule
@@ -634,15 +612,9 @@ static std::atomic<bool> g_phys_alive{false};
 static std::atomic<uint64_t> g_native_phys_enable{0};
 static std::atomic<float> g_native_last_dt{0.0f};
 
-//////////////////////////////////////////////////////////////////////////////////
-// The ground raycast, moved out of CET.
-//
-// The query is the game's own - the global script function GetSpatialQueriesSystem() and its
-// SyncRaycastByQueryFilter method, which is exactly what Lua was calling. Nothing about the
-// signature is hardcoded: parameter roles, the filter's mask offsets and the hit position's offset
-// are read out of RTTI on first use. A game update that reorders a parameter disables the raycast
-// instead of writing past a buffer, and Lua's own raycast keeps working underneath.
-//////////////////////////////////////////////////////////////////////////////////
+// Ground raycast, moved out of CET. Uses the game's own SyncRaycastByQueryFilter via RTTI:
+// parameter roles, filter mask offsets and the hit-position offset are read from RTTI on first use;
+// a signature change disables the raycast instead of writing past a buffer.
 static std::atomic<float> g_query_offset{2.0f};     // start the ray this far above the vehicle
 static std::atomic<float> g_query_distance{100.0f}; // how far down to look
 static std::atomic<uint64_t> g_query_mask1{0};
@@ -694,7 +666,7 @@ static void ReportGroundRay()
         g_ray.dead = true;
     }
     char buf[256];
-    std::snprintf(buf, sizeof(buf), "DAV dbg: ground ray %s (%s) params=%d filter=%u m1=%d m2=%d out=%u hit_z=%d",
+    std::snprintf(buf, sizeof(buf), "ground ray %s (%s) params=%d filter=%u m1=%d m2=%d out=%u hit_z=%d",
                   g_ray.usable ? "ready" : "off", g_ray.why, g_ray.param_count, g_ray.filter_size, g_ray.mask1_off,
                   g_ray.mask2_off, g_ray.out_size, g_ray.hit_z_off);
     g_sdk->logger->Info(g_plugin_handle, buf);
@@ -724,8 +696,7 @@ static int32_t FindPropertyOffset(RED4ext::CBaseRTTIType* aType, const char* aNa
 
 // A wrong layout is an access violation rather than a C++ exception, and the game would take it.
 // Kept in its own function with nothing that needs unwinding so the guard is legal.
-// Exception code from the most recent SafeExecute (0 = no exception); logged by the sound path
-// so "threw" finally says WHAT was thrown (0xC0000005 = access violation, etc.).
+// Last SafeExecute exception code (0 = none); logged by the sound path to say WHAT was thrown.
 static std::atomic<uint32_t> g_last_exception_code{0};
 
 static bool SafeExecute(void* aInstance, RED4ext::CBaseFunction* aFunc, void* aOut, RED4ext::StackArgs_t* aArgs)
@@ -1062,10 +1033,9 @@ static void RotSpeed(float lr, float lp, float cur_roll, float cur_pitch, float 
     float nr = fm_deg(std::atan2(R[1][0], R[0][0]));
     float np = fm_deg(std::atan2(-R[2][0], std::sqrt(R[2][1] * R[2][1] + R[2][2] * R[2][2])));
     float ny = fm_deg(std::atan2(R[2][1], R[2][2]));
-    // The Lua caller binds the FIRST return value (new_pitch - pitch) to d_roll and the second
-    // (new_roll - roll) to d_pitch, then does roll += d_roll / pitch += d_pitch. The crossing is in
-    // the original and must be reproduced exactly; without it the helicopter's lean axes permute.
-    // Also wrapped to [-180,180]: at cur_yaw = 179.96 the raw difference jumped to -359.90 in-game.
+    // The Lua caller binds the FIRST return value (new_pitch - pitch) to d_roll and the second to
+    // d_pitch; the crossing is in the original and must be reproduced (helicopter lean axes). Also
+    // wrapped to [-180,180]: near +-180 the raw difference jumped to -359.9 in-game.
     d_roll = fm_wrap180(np - cur_pitch);
     d_pitch = fm_wrap180(nr - cur_roll);
     d_yaw = fm_wrap180(ny - cur_yaw);
@@ -1130,10 +1100,9 @@ static void GameEuler(const RED4ext::Quaternion& q, float& roll, float& pitch, f
     yaw = fm_wrap180(fm_deg(std::atan2(ry, rx)));
 }
 
-// One physics tick of the unboarded hover: CalculateIdleMode's law, then Engine:Run's own attitude
-// restore added on top. Lua really does restore twice on this path (CalculateIdleMode returns world
-// rates, Run adds its own d_roll/d_pitch/d_yaw to them) and that stiffness is what the hover feels
-// like, so the duplication is reproduced rather than cleaned up.
+// One physics tick of the unboarded hover: CalculateIdleMode's law plus Engine:Run's own attitude
+// restore on top. The double restore is in the original and is what the hover feels like, so it is
+// reproduced rather than cleaned up.
 static void IdleStep(const RED4ext::vehicle::PhysicsData* pd, const IdleParams& ip,
                      RED4ext::Vector3& out_vel, RED4ext::Vector3& out_ang)
 {
@@ -1259,7 +1228,7 @@ static void FmStep(RED4ext::vehicle::PhysicsData* pd, const FlightModel& m, floa
         // The fixed offset failed: report where the matching quaternion actually lives (once).
         const int off = ScanForQuaternion(pd->vehicle, m.cetq, 0x600);
         char buf[192];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: att fallback scan vehicle_off=0x%X", off);
+        std::snprintf(buf, sizeof(buf), "att fallback scan vehicle_off=0x%X", off);
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
     const float qn = std::sqrt(q.i * q.i + q.j * q.j + q.k * q.k + q.r * q.r);
@@ -1540,20 +1509,6 @@ static void SetFlightControlState(int mode, const RED4ext::Vector3& vel, const R
 {
     if (g_sdk)
     {
-        static int s_lastLoggedMode = -999;
-        static RED4ext::Vector3 s_lastLoggedVel{0, 0, 0};
-        const bool velChanged = std::abs(vel.X - s_lastLoggedVel.X) > 0.5f ||
-                                std::abs(vel.Y - s_lastLoggedVel.Y) > 0.5f ||
-                                std::abs(vel.Z - s_lastLoggedVel.Z) > 0.5f;
-        if (mode != s_lastLoggedMode || (mode == 2 && velChanged))
-        {
-            s_lastLoggedMode = mode;
-            s_lastLoggedVel = vel;
-            char buf[160];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: SetFlightControl mode=%d vel=(%.2f,%.2f,%.2f)",
-                          mode, vel.X, vel.Y, vel.Z);
-            g_sdk->logger->Info(g_plugin_handle, buf);
-        }
     }
     int next = 1 - g_fc_idx.load(std::memory_order_relaxed);
     g_fc_buf[next].velocity = vel;
@@ -1566,20 +1521,6 @@ static void SetFlightControlState(int mode, const RED4ext::Vector3& vel, const R
 REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
                           RED4ext::vehicle::WheeledPhysics* physics, float deltaTime)
 {
-    static std::atomic<uint64_t> s_entry{0};
-    if (g_sdk)
-    {
-        const uint64_t e = s_entry.fetch_add(1, std::memory_order_relaxed);
-        if (e < 5)
-        {
-            char buf[160];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: hook entry #%llu hash=%llu expected=%llu",
-                          (unsigned long long)e,
-                          physics->parent ? (unsigned long long)physics->parent->entityID.hash : 0ULL,
-                          (unsigned long long)g_fly_vehicle_entity_id_hash);
-            g_sdk->logger->Info(g_plugin_handle, buf);
-        }
-    }
     if (IsFlyVehicle(physics->parent))
     {
         static std::atomic<uint64_t> s_dbg_counter{0};
@@ -1589,7 +1530,7 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
             // One-shot proof that the physics hook runs for the AV (the whole native path depends on it).
             g_hook_thread_id.store(static_cast<uint32_t>(GetCurrentThreadId()), std::memory_order_relaxed);
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: physics hook live for our vehicle (tid=%lu)",
+            std::snprintf(buf, sizeof(buf), "physics hook live for our vehicle (tid=%lu)",
                           (unsigned long)GetCurrentThreadId());
             g_sdk->logger->Info(g_plugin_handle, buf);
         }
@@ -1604,7 +1545,7 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
             if (n < 3 && g_sdk)
             {
                 char pbuf[128];
-                std::snprintf(pbuf, sizeof(pbuf), "DAV dbg: hook re-enabled physics (#%llu)",
+                std::snprintf(pbuf, sizeof(pbuf), "hook re-enabled physics (#%llu)",
                               (unsigned long long)n);
                 g_sdk->logger->Info(g_plugin_handle, pbuf);
             }
@@ -1627,10 +1568,9 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
             }
             g_native_gravity.store(physicsData->unk1B0, std::memory_order_relaxed);
             FlightControlState fc = g_fc_buf[g_fc_idx.load(std::memory_order_acquire)];
-            // Phase 5 auto re-assert: Lua's per-input mode 3 re-assert (the AV:Operate shim) is
-            // gone. With a driver aboard, no autopilot, and any held command non-zero, the flight
-            // model must run regardless of the last mode Lua pushed - landing with throttle held
-            // means takeoff intent, exactly the old shim's semantics.
+            // Phase 5 auto re-assert: with a driver aboard, no autopilot, and any held command
+            // non-zero, run the flight model regardless of the last mode pushed (throttle held at
+            // landing means takeoff intent - the old AV:Operate shim's semantics).
             if ((fc.mode == 2 || fc.mode == 4) && HeldCommandActive())
             {
                 const int32_t flags = g_flight_flags.load(std::memory_order_relaxed);
@@ -1648,15 +1588,6 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
                     w.velocity = RED4ext::Vector3{0, 0, 0};
                     w.angularVelocity = RED4ext::Vector3{0, 0, 0};
                 }
-            }
-            if ((dbg_n % 240) == 120 && g_sdk)
-            {
-                // Heartbeat: proves the hook keeps running for our vehicle (dismount/park states were
-                // suspected of stopping the physics step, which would silently drop every mode push).
-                char hbuf[128];
-                std::snprintf(hbuf, sizeof(hbuf), "DAV dbg: hook apply heartbeat #%llu mode=%d vz=%.2f",
-                              (unsigned long long)dbg_n, fc.mode, fc.velocity.Z);
-                g_sdk->logger->Info(g_plugin_handle, hbuf);
             }
             if (fc.mode == 1)
             {
@@ -1685,10 +1616,9 @@ REGISTER_DAV_HOOK_HASH(void __fastcall, 2526549425, VehicleApplyAllResistances,
                     // Contact teaches the ground on the game thread; CET only seeds it.
                     ip.ground_z = g_ground_z.load(std::memory_order_relaxed);
                 }
-                // Engine:CalculateIdleMode skips its altitude term while the vehicle touches
-                // something - that is what lets a landed AV rest instead of being shoved upward. Lua
-                // re-checked IsCollision() every tick; the published contact flag is the same signal,
-                // and without it a settled AV was pinned against whatever it had landed on.
+                // CalculateIdleMode skips its altitude term while the vehicle touches something -
+                // that is what lets a landed AV rest. The published contact flag is Lua's per-tick
+                // IsCollision() check; without it a settled AV was shoved upward.
                 if (g_av_on_ground.load(std::memory_order_relaxed) != 0.0f)
                 {
                     ip.idle_gravity = 0.0f;
@@ -1792,7 +1722,7 @@ void SetVehicle(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, fl
     if (g_sdk)
     {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: SetVehicle hash=%llu resolved=%d",
+        std::snprintf(buf, sizeof(buf), "SetVehicle hash=%llu resolved=%d",
                       (unsigned long long)entity_id_hash, g_fly_vehicle ? 1 : 0);
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
@@ -2123,11 +2053,8 @@ void GetNativeTickCount(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aF
     *aOut = (float)g_native_tick_count.load(std::memory_order_relaxed);
 }
 
-// CET pushes the flight control target; the physics-tick hook applies it every tick.
-// mode: 0=off, 1=add force/torque (AddForce semantics), 2=write velocity directly (ChangeVelocity semantics).
-// Push the flight context bits (bit0 = player aboard, bit1 = autopilot) that gate the physics
-// hook's auto mode re-assert. The hook must not run the flight model without a driver aboard
-// (the mode 4 idle hover lives outside the vehicle), and must not fight the autopilot.
+// Push flight context bits (bit0 aboard, bit1 autopilot, bit2 heli) gating the auto mode re-assert:
+// no flight model without a driver, never fight the autopilot.
 void SetFlightFlags(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
@@ -2139,6 +2066,8 @@ void SetFlightFlags(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame
     *aOut = 1.0f;
 }
 
+// CET pushes the flight control target; the physics-tick hook applies it every tick.
+// mode: 0=off, 1=add force/torque, 2=write velocity directly, 4=native idle hover.
 void SetFlightControl(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
 {
     RED4EXT_UNUSED_PARAMETER(aContext);
@@ -2309,11 +2238,8 @@ void SetFlightModel(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame
     RED4ext::GetParameter(aFrame, &v10);
     aFrame->code++; // skip ParamEnd
 
-    // v1 = flight_mode, has_gravity, dt_scale, ncmd
-    // v2 = reset, action1..3
-    // v3 = action4..6, value1
-    // v4 = value2..5
-    // v5 = value6, -, -, -
+    // Wire layout: v1 = flight_mode, has_gravity, dt_scale, ncmd; v2 = reset, action1..3;
+    // v3 = action4..6, value1; v4 = value2..5; v5 = value6, -, -, -.
     const float acts[6] = {v2.Y, v2.Z, v2.W, v3.X, v3.Y, v3.Z};
     const float vals[6] = {v3.W, v4.X, v4.Y, v4.Z, v4.W, v5.X};
 
@@ -2845,31 +2771,18 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterDAVHock()
 #endif
 }
 
-//////////////////////////////////////////////////////////////////////////////////
-// Thruster swing + sound layer edges (game thread, driven from DavGameState_OnUpdate).
-//
-// Both were Lua loop work: MoveThruster integrated the swing angle per control tick, ControlSound
-// latched the accel/thruster layers and stopped them after a grace of idle ticks. The held command
-// state (g_cmd_val) already carries everything they consumed, so the DLL runs both from its own
-// per-frame cadence. Lua pushes the setup: thruster gains and component names once per spawn, the
-// sound action lists and grace once per engine init.
-//
-// The sound layers cannot be finished in C++ - the samples live in CET's sound object - so the DLL
-// only decides WHEN a layer starts or stops and dispatches a REDscript custom event (DAV.SndEdgeEvent)
-// through the game's CallbackSystem per edge. The CET side registers a NewProxy listener straight
-// on the CallbackSystem (Core:InitSoundEdgeListeners) and plays the samples. QueueEvent with a
-// custom name is dropped by the game, hence the CallbackSystem.
-//////////////////////////////////////////////////////////////////////////////////
+// Thruster swing + sound layer edges, game thread, driven from DavGameState_OnUpdate (both were
+// Lua loop work). Lua pushes the setup once per spawn/engine init; the DLL integrates the swing and
+// detects sound edges from its own per-frame cadence, dispatching each edge as a game action event.
 
 // Game-thread-only state: Lua pushes from CET (game thread), OnUpdate consumes on the same thread.
 static bool g_thr_enabled = false;
 static float g_thr_step_rate = 12.0f;    // deg/s at full command (Lua converts its per-tick step to deg/s)
 static float g_thr_restore_rate = 6.0f;  // deg/s restore toward zero
 static float g_thr_max = 0.0f;           // deg
-// Rotation axis in the component's local frame: 0=X+ 1=X- 2=Y+ 3=Y- 4=Z+ 5=Z-.
-// The engine components' local Y happens to run along the vehicle's forward axis, so the old
-// hardcoded Y yaw looked like a roll (thrusters swinging sideways); Lua picks the axis per
-// vehicle with one number it can be tuned with.
+// Rotation axis in the component's local frame: 0=X+ 1=X- 2=Y+ 3=Y- 4=Z+ 5=Z-. The engine
+// components' local Y runs along the vehicle's forward axis, so the old hardcoded Y yaw looked like
+// roll; Lua picks the axis per vehicle with one tunable number.
 static int32_t g_thr_axis = 2;
 static uint32_t g_thr_setup_seq = 0;     // bumped whenever Lua re-pushes the setup
 static std::atomic<float> g_thr_ext_fwd{0.0f};  // autopilot swing input (Lua pushes on change)
@@ -2919,14 +2832,9 @@ static void SplitIds(const char* aText, std::vector<int32_t>& aOut)
         aOut.push_back(static_cast<int32_t>(std::strtol(p.c_str(), nullptr, 10)));
 }
 
-// Resolve the swing targets by name straight out of the entity's component storage in memory.
-// Script-calling FindComponentByName from the DLL crashed the game, and CET refuses to marshal
-// component handles into native function parameters (concrete ref types, IScriptable, and
-// ScriptRef all failed), so neither "DLL resolves via script" nor "Lua passes handles" works.
-// What remains is the plain data path: Lua passes the names (SetThrusterSetup), the DLL walks
-// entEntity.componentsStorage (embedded at +0x70; components DynArray at +0x30: entries ptr,
-// u32 size, u32 capacity) and matches entIComponent.name (CName at +0x40). Every read is SEH
-// guarded, the walk is capped, and a failed resolve just leaves the thruster off.
+// Resolve the swing targets by name from the entity's component storage in memory (script
+// FindComponentByName crashes from the DLL; CET cannot marshal component handles). Walks
+// entEntity.componentsStorage (+0x70) matching entIComponent.name (CName @0x40), SEH-guarded.
 static bool SafePeekPtr(void* aAddr, void** aOut)
 {
     __try
@@ -2964,7 +2872,7 @@ static void ResolveThrusterComponents()
     if (!SafePeekPtr(entity + 0x70 + 0x30, &entries) || entries == nullptr)
     {
         if (g_sdk)
-            g_sdk->logger->Info(g_plugin_handle, "DAV dbg: thruster mem-resolve: no component array");
+            g_sdk->logger->Info(g_plugin_handle, "thruster mem-resolve: no component array");
         return;
     }
     if (!SafePeekPtr(entity + 0x70 + 0x38, &sizeCap))
@@ -2994,7 +2902,7 @@ static void ResolveThrusterComponents()
     if (g_sdk)
     {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: thruster comps mem-resolved %d/%d (entity comps=%u)",
+        std::snprintf(buf, sizeof(buf), "thruster comps mem-resolved %d/%d (entity comps=%u)",
                       (int)s_thr_components.size(), (int)s_thr_names.size(), count);
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
@@ -3059,20 +2967,9 @@ static void ThrusterTick(float aDt)
     s_thr_written = s_thr_angle;
 }
 
-// Sound edges cross to the game's action queue inside DispatchSndEdge; nothing polls them.
-// Sound edges are queued straight into the game's own action event queue from the game thread:
-// the edge detector (SoundEdgeTick) rides the frame clock, and playback is just
-// player:QueueEvent(ActionEvent) - a plain game API the DLL may call right here. The earlier
-// design shipped edges back to Lua through a shared atomic polled by the control loop purely
-// because the playback code lived in Lua; that made the sound depend on the Lua control loop.
-//
-// game::ActionEvent (size 0x68): red::Event header, then from AI::AIEvent name CName @0x40 and
-// timeToLive float @0x48, then eventAction CName @0x50. CName is the lowercase FNV-1a hash.
-// ActionEvent is a script CLASS (ref type, Lua calls .new() on it), so a plain zeroed buffer is
-// not enough: the instance must come from CClass::CreateInstance to carry the vtable and be
-// refcount-manageable. The Handle guard mirrors what the script GC would do with Lua's .new().
-// Step breadcrumbs for the sound queue path (RED4ext logger only; the unbuffered trace-file
-// mirror that was used to pin down the crash is gone now that the path is stable).
+// Sound edges queue straight into the game's action event queue from the game thread:
+// SoundEdgeTick rides the frame clock, playback is player:QueueEvent(ActionEvent).
+// game::ActionEvent (0x68): name @0x40, timeToLive @0x48, eventAction @0x50 (CreateInstance-made).
 static void DavLogStep(const char* aWhat)
 {
     if (g_sdk != nullptr)
@@ -3106,30 +3003,18 @@ static uint32_t SafeTypeSize(const RED4ext::CBaseRTTIType* aType)
     }
 }
 
-// One-shot, read-only RTTI census for the sound path. Pure data reads (no script execution),
-// so it cannot destabilize the game. It answers what the guessing cycle kept missing: which
-// class really defines QueueEvent and with what signature, the real puppet getter names on
-// cpPlayerSystem, and the real ActionEvent field offsets.
-// Resolve any entity by id hash (FindEntityByID is the proven DLL-side lookup used for the
-// vehicle since the beginning).
-// aClassName: RTTI class to instantiate (gameActionEvent for the sound layer and the threshold
-// monitor; the monitor relay lives in the MOD's REDscript).
-// aTtl: timeToLive. Unknown actions ignore it, so the height monitor smuggles the measured height
-// in this float - the Lua side reads event.timeToLive back (see OnDavThresholdEvent).
+// QueueDavEvent: instantiate aClassName (e.g. gameActionEvent), set eventAction/timeToLive, and
+// queue it on the puppet. aTtl doubles as the height payload for the monitor (Lua reads it back).
 static void QueueDavEvent(const char* aClassName, const char* aEventName, float aTtl = 1.5f)
 {
-    // Exit etiquette: once the Running state is exiting, stop feeding the game's event dispatch.
-    // Events queued into a teardown in progress are processed by game code that no longer has the
-    // puppet or the script domain behind them - our SEH guards cannot see that deferred crash.
+    // Events queued into a teardown are dispatched later by game code whose puppet is gone.
     if (g_shutting_down.load(std::memory_order_relaxed))
         return;
     const char* fail = nullptr;
     auto* rtti = RED4ext::CRTTISystem::Get();
     RED4ext::IScriptable* player = nullptr;
-    // Primary: resolve the puppet fresh from cpPlayerSystem on every edge. The earlier DLL-side
-    // attempts failed because the handle<> return (0x10 bytes) was written into an 8-byte slot,
-    // smashing the stack; with a proper Handle out the call is safe. Fresh resolution also
-    // survives player respawn (the entity id changes), which a Lua-pushed id cannot.
+    // Resolve the puppet fresh from cpPlayerSystem on every edge: a proper Handle out is safe and
+    // fresh resolution survives respawn (the entity id changes).
     RED4ext::ScriptGameInstance game_instance;
     auto* ps_type = (rtti != nullptr) ? rtti->GetClass("cpPlayerSystem") : nullptr;
     RED4ext::IScriptable* ps = (ps_type != nullptr && game_instance.instance != nullptr)
@@ -3172,7 +3057,7 @@ static void QueueDavEvent(const char* aClassName, const char* aEventName, float 
         if (g_sdk)
         {
             char buf[96];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavEvent fail: %s (%s/%s)", fail, aClassName, aEventName);
+            std::snprintf(buf, sizeof(buf), "QueueDavEvent fail: %s (%s/%s)", fail, aClassName, aEventName);
             g_sdk->logger->Info(g_plugin_handle, buf);
         }
         return;
@@ -3199,7 +3084,7 @@ static void QueueDavEvent(const char* aClassName, const char* aEventName, float 
         if (g_sdk)
         {
             char buf[96];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavEvent fail: evt props missing (%s)", aEventName);
+            std::snprintf(buf, sizeof(buf), "QueueDavEvent fail: evt props missing (%s)", aEventName);
             g_sdk->logger->Info(g_plugin_handle, buf);
         }
         return;
@@ -3209,10 +3094,8 @@ static void QueueDavEvent(const char* aClassName, const char* aEventName, float 
     // Optional 'key' field (custom event classes can carry the name in their own property).
     if (auto* key_prop = find_prop(evt_cls, "key"); key_prop != nullptr)
         key_prop->SetValue<RED4ext::CName>(evt, RED4ext::CName(RED4ext::FNV1a64(aEventName)));
-    // Build every declared parameter slot, not just the first: QueueEvent may take extra
-    // parameters (name/sticky style) and the VM reads whatever the stack holds for missing
-    // ones - the leading suspect for the crash that survives the handle-slot fix. Slot 0 gets
-    // the ActionEvent handle slot; the rest get zeroed buffers sized from RTTI.
+    // Build every declared parameter slot, not just the first: the VM reads whatever the stack
+    // holds for missing params. Slot 0 gets the event handle; the rest get RTTI-sized zero buffers.
     RED4ext::StackArgs_t args;
     // Handle-typed arguments must be the address of a real Handle object (0x10 bytes: instance +
     // ref controller). Passing the address of a bare void* slot made the VM read 8 bytes of
@@ -3245,7 +3128,7 @@ static void QueueDavEvent(const char* aClassName, const char* aEventName, float 
         if (g_sdk)
         {
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavEvent fail: QueueEvent threw exc=0x%08X (%s)",
+            std::snprintf(buf, sizeof(buf), "QueueDavEvent fail: QueueEvent threw exc=0x%08X (%s)",
                           g_last_exception_code.load(std::memory_order_relaxed), aEventName);
             g_sdk->logger->Info(g_plugin_handle, buf);
         }
@@ -3257,14 +3140,9 @@ static void QueueDavSound(const char* aEventName)
     QueueDavEvent("gameActionEvent", aEventName);
 }
 
-// ---- Threshold monitor (Phase 5) ----
-// Lua pre-arms the thresholds and a per-situation enable mask (1=height, 2=player distance,
-// 4=entry area). The monitor rides the frame clock on the game thread: height comes from the
-// same ground raycast the hover uses, the player position from one cheap VM call per frame.
-// A crossing is announced as a plain gameActionEvent (eventAction = dav_evt_*) queued on the
-// puppet through the proven QueueDavEvent path; the MOD's REDscript relay cb forwards it to the
-// native callback system ('DAV/Monitor') where the CET listener lives - Lua cannot hook entity
-// cbs, and DLL-created custom event classes never reach a cb (registration lives in 'new').
+// Threshold monitor: Lua pre-arms thresholds and an enable mask (1=height, 2=distance, 4=entry);
+// crossings ride the frame clock and fire gameActionEvents (eventAction=dav_evt_*) that the MOD's
+// REDscript relay forwards to the CET listener.
 static std::atomic<float> g_mon_height_thr{0.0f};
 static std::atomic<float> g_mon_dist_thr{0.0f};
 static std::atomic<float> g_mon_entry_radius{0.0f};
@@ -3327,7 +3205,7 @@ void SetWorldGone(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, 
     if (g_sdk)
     {
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: SetWorldGone(%d)", gone != 0.0f ? 1 : 0);
+        std::snprintf(buf, sizeof(buf), "SetWorldGone(%d)", gone != 0.0f ? 1 : 0);
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
     *aOut = 1.0f;
@@ -3449,13 +3327,9 @@ static void MonitorTick(float aDt)
                               s_height_state == -1 ? "dav_evt_height_low" : "dav_evt_height_high",
                               height);
             }
-            // The VFX slot position lives in Lua (it has a proven component handle there).
-            // While inside the warning zone the DLL re-fires a tick carrying the fresh height in
-            // timeToLive, so Lua re-projects the VFX without polling. The tick only needs to fire
-            // when the VFX actually moves: descending changes the height by more than the deadband
-            // every frame (tracking stays per-frame), while a stationary hover would otherwise
-            // push 60 events+VM dispatches+Lua calls per second - and that event storm was the
-            // prime suspect once quit-to-desktop crashes started correlating with the VFX work.
+            // The VFX slot position lives in Lua (proven component handle there). Inside the
+            // warning zone the tick re-fires with fresh height in timeToLive so Lua re-projects
+            // without polling; the deadband keeps a stationary hover from a 60 Hz event storm.
             if (s_height_state == -1 && g_vfx_enabled.load(std::memory_order_relaxed) != 0.0f)
             {
                 static float s_last_tick_height = 1e9f;
@@ -3552,7 +3426,7 @@ static void DispatchSndEdge(int32_t aCode)
     if (g_sdk)
     {
         char buf[80];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: snd edge code=%d evt=%s", (int)aCode,
+        std::snprintf(buf, sizeof(buf), "snd edge code=%d evt=%s", (int)aCode,
                       evt != nullptr ? evt : "none");
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
@@ -3570,17 +3444,13 @@ static bool HeldAny(const std::vector<int32_t>& aIds)
     return false;
 }
 
-// ControlSound as a continuous timer: latch on the first held command of a layer, and only after
-// the layer has been idle for the whole grace fire the stop edge. The layers stay independent so
-// acceleration cannot starve the thruster layer, exactly like the Lua original.
+// ControlSound as a continuous timer: latch on the first held command of a layer; fire the stop
+// edge only after the layer idled for the whole grace. Layers are independent.
 // Codes: 1 accel start, 2 accel stop, 3 thruster start, 4 thruster stop.
 static void SoundEdgeTick(float aDt)
 {
-    // Manual input only - the same gate as the flight auto re-assert. While the autopilot is
-    // engaged, manual held commands must not start the acceleration layer (the input itself is
-    // ignored, but the sound used to blip anyway); an already-running layer fades out through the
-    // grace timer. The aboard bit matters too: outside the vehicle the held state can carry stale
-    // presses, and the old Lua path only dispatched sound from the in-vehicle Operate.
+    // Manual input only - same gate as the flight auto re-assert: no accel layer from held keys
+    // during autopilot, and the aboard bit keeps stale outside-vehicle presses from starting sound.
     const int32_t flags = g_flight_flags.load(std::memory_order_relaxed);
     const bool manual = (flags & 1) != 0 && (flags & 2) == 0;
     if (manual && HeldAny(g_snd_accel_ids))
@@ -3658,7 +3528,7 @@ void SetThrusterSetup(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFra
     if (g_sdk)
     {
         char buf[256];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: thruster setup en=%d step=%.4f restore=%.4f max=%.1f axis=%d names=%d",
+        std::snprintf(buf, sizeof(buf), "thruster setup en=%d step=%.4f restore=%.4f max=%.1f axis=%d names=%d",
                       (int)enabled, step, restore, max_angle, (int)g_thr_axis, (int)s_thr_names.size());
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
@@ -3703,7 +3573,7 @@ void SetSoundParams(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame
     if (g_sdk)
     {
         char buf[256];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: sound params grace=%.2f accel=[%s] thr=[%s]", g_snd_grace,
+        std::snprintf(buf, sizeof(buf), "sound params grace=%.2f accel=[%s] thr=[%s]", g_snd_grace,
                       accel_ids ? accel_ids->c_str() : "", thr_ids ? thr_ids->c_str() : "");
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
@@ -3762,18 +3632,9 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetSoundParams()
     cls.RegisterFunction(func);
 }
 
-//////////////////////////////////////////////////////////////////////////////////
-// A game-thread per-frame callback.
-//
-// The physics hook lives on the physics thread: RED4ext::TLS::Get() reads the thread's own TEB slot,
-// so the world pointer is only valid on the game thread, script handles must not be touched there,
-// and a scene query during the step re-enters the physics engine. Anything needing the world, the
-// player, or a raycast therefore fell to CET, polling from Lua.
-//
-// RED4ext game states give the missing cadence: OnUpdate runs on the game thread once per frame.
-// The ground reference is published from here, which is what lets Lua stop raycasting for height.
-// Contact is enough to learn it: while the vehicle touches something, the ground is right under it.
-//////////////////////////////////////////////////////////////////////////////////
+// Game-thread per-frame callback (RED4ext game state OnUpdate). The physics hook cannot touch the
+// world, script handles, or run scene queries (physics-thread restrictions); everything that needs
+// the world - ground raycast, monitor, thruster swing, sound edges - runs here once per frame.
 static bool RED4EXT_CALL DavGameState_OnEnter(RED4ext::CGameApplication* aApp)
 {
     RED4EXT_UNUSED_PARAMETER(aApp);
@@ -3783,64 +3644,43 @@ static bool RED4EXT_CALL DavGameState_OnEnter(RED4ext::CGameApplication* aApp)
 static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
 {
     RED4EXT_UNUSED_PARAMETER(aApp);
-    // Quit to desktop: once the Running state is exiting, the world is going away under us. Do
-    // nothing at all - the exit movie runs hundreds of frames per second and every world touch
-    // there is a use-after-free waiting to happen.
+    // Quit to desktop: the exit movie runs hundreds of fps; every world touch there is UAF.
     if (g_shutting_down.load(std::memory_order_relaxed))
         return false;
-    // World detached (exit movie or save teardown): the game is despawning entities and disabling
-    // their physics right now. Re-enabling physics on a dying vehicle was the exit hang - Lua's
-    // GameObserver.OnDetach raises this flag long before OnExit fires.
+    // World detached (SetWorldGone): despawn/teardown in progress, touch nothing.
     if (g_world_gone.load(std::memory_order_relaxed))
         return false;
     g_game_thread_id.store(static_cast<uint32_t>(GetCurrentThreadId()), std::memory_order_relaxed);
     const uint64_t n = g_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    // Resolve the query's shape as soon as a world exists, whether or not the vehicle is flying, so
-    // the diagnostic lands in the log instead of waiting for someone to take off.
-    if (!kExpNoRaycast && !g_ray.usable && !g_ray.dead && (n % 30) == 0)
+    // Resolve the raycast shape as soon as a world exists, flying or not.
+    if (!g_ray.usable && !g_ray.dead && (n % 30) == 0)
     {
         ResolveGroundRay();
     }
     if (n == 1 && g_sdk)
     {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "DAV dbg: game state OnUpdate live (raycast=%d physre=%d, tid=%lu, physics tid=%lu)",
-                      kExpNoRaycast ? 0 : 1, kExpNoPhysReenable ? 0 : 1,
+        std::snprintf(buf, sizeof(buf), "game state OnUpdate live (tid=%lu, physics tid=%lu)",
                       (unsigned long)GetCurrentThreadId(), (unsigned long)g_hook_thread_id.load());
-        g_sdk->logger->Info(g_plugin_handle, buf);
-    }
-        if ((n % 600) == 300 && g_sdk)
-    {
-        // Heartbeat proving OnUpdate (and therefore ThrusterTick/SoundEdgeTick) still runs; also
-        // samples the physics state so a game-side disable becomes visible in the log.
-        char buf[96];
-        const int phys = VehicleBodyAlive() ? (int)g_fly_vehicle->physicsState : -1;
-        std::snprintf(buf, sizeof(buf), "DAV dbg: OnUpdate heartbeat #%llu phys=%d", (unsigned long long)n, phys);
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
 
     if (VehicleBodyAlive())
     {
         // The game disables physics (physicsState != 0) when the AV lands or touches something
-        // after dismount. A disabled body is never simulated, so the physics hook stops running
-        // and every mode push is silently dropped - the "recall does not climb" bug. The hook's
-        // own safety net cannot fire in that case (it lives inside the physics step), so physics
-        // is re-asserted here on the frame clock. Lua clears the vehicle handle on despawn
-        // (SetVehicle(0)), so a deleted entity can never be touched here.
+        // after dismount; a disabled body is never simulated, so hook pushes are dropped (the
+        // "recall does not climb" bug). Re-assert physics here on the frame clock.
         if (g_fly_vehicle->physicsState != 0)
         {
             const uint64_t rn = g_native_phys_enable.fetch_add(1, std::memory_order_relaxed);
-            // Log BEFORE the call: ForceEnablePhysics is a hash-resolved static entry point that has
-            // never been observed firing; if it ever faults, the log shows it was reached.
             if (rn < 3 && g_sdk)
             {
                 char pbuf[128];
-                std::snprintf(pbuf, sizeof(pbuf), "DAV dbg: OnUpdate re-enabling physics (state=%d)",
+                std::snprintf(pbuf, sizeof(pbuf), "OnUpdate re-enabling physics (state=%d)",
                               (int)g_fly_vehicle->physicsState);
                 g_sdk->logger->Info(g_plugin_handle, pbuf);
             }
-            if (!kExpNoPhysReenable)
-                g_fly_vehicle->ForceEnablePhysics();
+            g_fly_vehicle->ForceEnablePhysics();
         }
         static bool s_was_on_ground = false;
         const bool on_ground = g_fly_vehicle->isOnGround;
@@ -3850,20 +3690,16 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
         {
             const float z = pd->worldPosition.Z;
             g_av_world_z.store(z, std::memory_order_relaxed);
-            // Learn the ground only on the frame contact starts. Re-learning it on every frame the
-            // vehicle rests on it kept the measured height at zero forever, so the regulator pushed
-            // up, the vehicle left the ground, the stale reference pulled it back down, and the loop
-            // shook the vehicle apart right before a despawn.
+            // Learn the ground only on the frame contact starts. Re-learning it every resting frame
+            // pinned the measured height at zero, so the regulator shook the vehicle apart.
             if (on_ground && !s_was_on_ground)
             {
                 g_ground_z.store(z, std::memory_order_relaxed);
                 g_ground_valid.store(1.0f, std::memory_order_relaxed);
             }
-            // Query on the cadence the hover actually consumes the answer on: twice a second, and
-            // only while the native hover is running. Airborne is the case contact cannot cover -
-            // over a rooftop edge or a pit the last contact is the wrong floor - but querying while
-            // landed too keeps the published value honest and makes the whole path observable from
-            // the probe without anyone having to take off. A miss leaves the last known ground alone.
+            // Refresh twice a second while the native hover runs (airborne contact cannot cover -
+            // rooftop edges/pits make the last contact the wrong floor). A miss keeps the last
+            // known ground.
             const bool hover_active = (g_fc_buf[g_fc_idx.load(std::memory_order_acquire)].mode == 4);
             if (hover_active && g_phys_alive.load(std::memory_order_relaxed) && (n % 30) == 0)
             {
@@ -3878,10 +3714,9 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
         }
         s_was_on_ground = on_ground;
     }
-    // Physics liveness: the hook ticks once per physics step of our vehicle. Ticks advancing
-    // means the physics scene is alive and cycling; no ticks for ~0.25s means physics is paused
-    // (menu, parked vehicle) or the world is being torn down. The exit flow pauses the world
-    // seconds before detaching it, so raycasts are off long before the scene starts dying.
+    // Physics liveness: hook ticks advancing = the physics scene is cycling; no ticks for ~0.25s =
+    // paused or tearing down. The exit flow pauses physics seconds before detach, so raycasts stop
+    // before the scene starts dying.
     {
         static uint64_t s_phys_last_ticks = 0;
         static int s_phys_dead_frames = 0;
@@ -3909,7 +3744,7 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
             if (++s_stall_frames == 180 && g_sdk)
             {
                 char sbuf[160];
-                std::snprintf(sbuf, sizeof(sbuf), "DAV dbg: hook stalled - no physics ticks for ~3s (phys=%d)",
+                std::snprintf(sbuf, sizeof(sbuf), "hook stalled - no physics ticks for ~3s (phys=%d)",
                               VehicleBodyAlive() ? (int)g_fly_vehicle->physicsState : -1);
                 g_sdk->logger->Info(g_plugin_handle, sbuf);
             }
@@ -3918,7 +3753,7 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
         {
             if (s_stall_frames >= 180 && g_sdk)
             {
-                g_sdk->logger->Info(g_plugin_handle, "DAV dbg: hook resumed after stall");
+                g_sdk->logger->Info(g_plugin_handle, "hook resumed after stall");
             }
             s_last_native_ticks = now_ticks;
             s_stall_frames = 0;
@@ -3938,28 +3773,25 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
         ThrusterTick(dt);
         SoundEdgeTick(dt);
         // Threshold monitor: height / player distance / entry-area edges announced as events.
-        if (!kExpNoRaycast && g_mon_mask.load(std::memory_order_relaxed) != 0)
+        if (g_mon_mask.load(std::memory_order_relaxed) != 0)
             MonitorTick(dt);
     }
     // MUST return false: RED4ext treats a state's OnUpdate returning true as "finished" and stops
-    // calling it next frame. Returning true here once made the whole frame clock (thruster swing,
-    // sound edges, ground raycast) run exactly one frame per game start.
+    // calling it next frame (the frame clock would run one tick per game start).
     return false;
 }
 
 static bool RED4EXT_CALL DavGameState_OnExit(RED4ext::CGameApplication* aApp)
 {
     RED4EXT_UNUSED_PARAMETER(aApp);
-    // Shutdown etiquette: this fires when the Running state pops (quit to desktop). The teardown
-    // that follows frees the vehicle entity while our handle still points at it, so drop every
-    // piece of world state the frame clock touches. Lua's despawn path (SetVehicle(0)) never runs
-    // on a quit; this is the only reliable place to let go.
+    // Quit to desktop: teardown frees the vehicle while our handle still points at it; Lua's
+    // despawn (SetVehicle(0)) never runs here, so drop all world state.
     g_shutting_down.store(true, std::memory_order_relaxed);
     g_mon_mask.store(0, std::memory_order_relaxed);
     g_fly_vehicle = RED4ext::Handle<RED4ext::vehicle::BaseObject>();
     g_fly_vehicle_entity_id_hash = 0;
     if (g_sdk)
-        g_sdk->logger->Info(g_plugin_handle, "DAV dbg: game state OnExit (shutdown guard armed)");
+        g_sdk->logger->Info(g_plugin_handle, "game state OnExit (shutdown guard armed)");
     return true;
 }
 
