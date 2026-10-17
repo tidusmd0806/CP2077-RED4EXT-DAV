@@ -625,7 +625,7 @@ struct GroundRayLayout
     bool usable = false;
     const char* why = "not probed";
 
-    RED4ext::CBaseFunction* get_sys = nullptr;
+    const RED4ext::CBaseRTTIType* sys_type = nullptr; // gameISpatialQueriesSystem, via IGameInstance::GetSystem
     RED4ext::CBaseFunction* func = nullptr;
     std::vector<uint8_t> roles;
     uint32_t filter_size = 0;
@@ -701,6 +701,8 @@ static bool SafeExecute(void* aInstance, RED4ext::CBaseFunction* aFunc, void* aO
 }
 
 // Read the query's shape out of RTTI. Game thread only. Retries until a world is loaded, then stops.
+static RED4ext::IScriptable* SafeGetSystem(RED4ext::IGameInstance* aGi, const RED4ext::CBaseRTTIType* aType);
+
 static bool ResolveGroundRay()
 {
     if (g_ray.usable)
@@ -718,25 +720,25 @@ static bool ResolveGroundRay()
         ReportGroundRay();
         return false;
     }
-    g_ray.get_sys = rtti->GetFunction("GetSpatialQueriesSystem");
-    if (g_ray.get_sys == nullptr)
+    auto* sq_type = rtti->GetClass("gameISpatialQueriesSystem");
+    if (sq_type == nullptr)
     {
-        g_ray.why = "GetSpatialQueriesSystem missing";
-        ReportGroundRay();
+        // RTTI fills in during boot, so an early probe can legitimately miss the class.
+        // Retryable - unlike the structural failures below this must not mark the ray dead.
+        g_ray.why = "gameISpatialQueriesSystem missing";
         return false;
     }
+    g_ray.sys_type = sq_type;
 
-    // handle<> return values are 0x10 bytes (instance + ref controller); receiving one into an
-    // 8-byte slot overflows the stack by 8 bytes.
-    RED4ext::Handle<RED4ext::IScriptable> sys{};
-    RED4ext::StackArgs_t none;
-    if (!SafeExecute(nullptr, g_ray.get_sys, &sys, &none) || sys.instance == nullptr)
+    RED4ext::ScriptGameInstance gi;
+    RED4ext::IScriptable* sys_inst = (gi.instance != nullptr) ? SafeGetSystem(gi.instance, sq_type) : nullptr;
+    if (sys_inst == nullptr)
     {
         // No world yet (boot, or between saves). Not an error - try again next frame.
         return false;
     }
 
-    auto* cls = static_cast<RED4ext::IScriptable*>(sys.instance)->GetType();
+    auto* cls = sys_inst->GetType();
     auto* func = (cls != nullptr) ? cls->GetFunction("SyncRaycastByQueryFilter") : nullptr;
     if (func == nullptr)
     {
@@ -790,8 +792,10 @@ static bool ResolveGroundRay()
                 role = GroundRayLayout::kTo;
                 have_to = true;
             }
-            else if (tn == "Boolean")
+            else if (tn == "Boolean" || tn == "Bool")
             {
+                // staticOnly/dynamicOnly inputs (and any other flag). Lua's own ground query passes
+                // false/false - the masks decide - and kBool args land as false, matching it.
                 role = GroundRayLayout::kBool;
             }
             else
@@ -813,7 +817,21 @@ static bool ResolveGroundRay()
                 }
                 else
                 {
-                    g_ray.why = "unexpected parameter";
+                    static char s_why_buf[320];
+                    int used = std::snprintf(s_why_buf, sizeof(s_why_buf), "unexpected parameter '%s' [", s ? s : "?");
+                    for (uint32_t k = 0; k < func->params.size && used > 0 && used < 260; ++k)
+                    {
+                        auto* q = func->params.entries[k];
+                        auto* qt = (q != nullptr) ? q->type : nullptr;
+                        const char* qn = (q != nullptr && q->name.ToString() != nullptr) ? q->name.ToString() : "?";
+                        const char* qtn = (qt != nullptr && qt->GetName().ToString() != nullptr) ? qt->GetName().ToString() : "?";
+                        used += std::snprintf(s_why_buf + used, sizeof(s_why_buf) - used, "%s%s:%s%s%s", k ? "," : "",
+                                              qn, qtn, (q != nullptr && q->flags.isReturn) ? "(ret)" : "",
+                                              (q != nullptr && q->flags.isOut) ? "(out)" : "");
+                    }
+                    if (used > 0)
+                        std::snprintf(s_why_buf + used, sizeof(s_why_buf) - used, "]");
+                    g_ray.why = s_why_buf;
                     ReportGroundRay();
                     return false;
                 }
@@ -841,9 +859,13 @@ static bool RaycastGroundZ(float ax, float ay, float aTop, float aDist, float* a
     {
         return false;
     }
-    RED4ext::Handle<RED4ext::IScriptable> sys{}; // handle<> returns are 0x10 bytes, see above
-    RED4ext::StackArgs_t none;
-    if (!SafeExecute(nullptr, g_ray.get_sys, &sys, &none) || sys.instance == nullptr)
+    // The system comes from IGameInstance::GetSystem (the proven cpPlayerSystem path); there is
+    // no global GetSpatialQueriesSystem function in RTTI - the earlier lookups all missed.
+    RED4ext::ScriptGameInstance gi;
+    RED4ext::IScriptable* sys_inst = (gi.instance != nullptr && g_ray.sys_type != nullptr)
+                                         ? SafeGetSystem(gi.instance, g_ray.sys_type)
+                                         : nullptr;
+    if (sys_inst == nullptr)
     {
         return false;
     }
@@ -890,7 +912,7 @@ static bool RaycastGroundZ(float ax, float ay, float aTop, float aDist, float* a
     }
 
     bool is_hit = false;
-    if (!SafeExecute(sys.instance, g_ray.func, &is_hit, &args) || !is_hit)
+    if (!SafeExecute(sys_inst, g_ray.func, &is_hit, &args) || !is_hit)
     {
         return false;
     }
@@ -2579,6 +2601,44 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterGetNativeTickCount()
     cls.RegisterFunction(func);
 }
 
+// Defined further down with the threshold monitor code.
+void SetThresholds(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4);
+void SetLandingVFX(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4);
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetThresholds()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    auto func = RED4ext::CClassFunction::Create(&cls, "SetThresholds", "SetThresholds", &SetThresholds,
+                                                {.isNative = true});
+    func->flags = RED4ext::CBaseFunction::Flags{.isNative = true};
+    func->SetReturnType("Float");
+    func->AddParam("Float", "height_thr");
+    func->AddParam("Float", "dist_thr");
+    func->AddParam("Float", "entry_radius");
+    func->AddParam("Float", "keepalive");
+    func->AddParam("Int32", "mask");
+    func->AddParam("Vector4", "entry_off");
+    cls.RegisterFunction(func);
+}
+
+RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetLandingVFX()
+{
+    auto rtti = RED4ext::CRTTISystem::Get();
+    auto scriptable = rtti->GetClass("IScriptable");
+    cls.parent = scriptable;
+
+    auto func = RED4ext::CClassFunction::Create(&cls, "SetLandingVFX", "SetLandingVFX", &SetLandingVFX,
+                                                {.isNative = true});
+    func->flags = RED4ext::CBaseFunction::Flags{.isNative = true};
+    func->SetReturnType("Float");
+    func->AddParam("Float", "enabled");
+    func->AddParam("Vector4", "offset");
+    cls.RegisterFunction(func);
+}
+
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterSetFlightFlags()
 {
     auto rtti = RED4ext::CRTTISystem::Get();
@@ -2991,98 +3051,13 @@ static uint32_t SafeTypeSize(const RED4ext::CBaseRTTIType* aType)
 // so it cannot destabilize the game. It answers what the guessing cycle kept missing: which
 // class really defines QueueEvent and with what signature, the real puppet getter names on
 // cpPlayerSystem, and the real ActionEvent field offsets.
-static void DumpSoundRTTIOnce()
-{
-    static bool s_done = false;
-    if (s_done || g_sdk == nullptr)
-        return;
-    s_done = true;
-    auto* rtti = RED4ext::CRTTISystem::Get();
-    if (rtti == nullptr)
-        return;
-    auto tn = [](RED4ext::CBaseRTTIType* t) -> const char* {
-        if (t == nullptr)
-            return "?";
-        const char* s = t->GetName().ToString();
-        return s != nullptr ? s : "?";
-    };
-    char buf[256];
-    // 1) ActionEvent layout, whole parent chain (verifies eventAction/timeToLive offsets).
-    for (const char* cls_name : {"gameActionEvent", "AIEvent", "redEvent"})
-    {
-        auto* cls = rtti->GetClass(cls_name);
-        if (cls == nullptr)
-        {
-            std::snprintf(buf, sizeof(buf), "DAV diag: class %s MISSING", cls_name);
-            g_sdk->logger->Info(g_plugin_handle, buf);
-            continue;
-        }
-        std::snprintf(buf, sizeof(buf), "DAV diag: %s size=%u props=%u", cls_name, SafeTypeSize(cls),
-                      (unsigned)cls->props.size);
-        g_sdk->logger->Info(g_plugin_handle, buf);
-        for (uint32_t i = 0; i < cls->props.size; ++i)
-        {
-            auto* p = cls->props.entries[i];
-            if (p == nullptr)
-                continue;
-            std::snprintf(buf, sizeof(buf), "DAV diag:   %s.%s @0x%X type=%s", cls_name,
-                          p->name.ToString() != nullptr ? p->name.ToString() : "?", (unsigned)p->valueOffset,
-                          tn(p->type));
-            g_sdk->logger->Info(g_plugin_handle, buf);
-        }
-    }
-    // 2) cpPlayerSystem parent chain + Player/GameObject method names.
-    auto* ps = rtti->GetClass("cpPlayerSystem");
-    if (ps == nullptr)
-        g_sdk->logger->Info(g_plugin_handle, "DAV diag: class cpPlayerSystem MISSING");
-    for (auto* cls = ps; cls != nullptr; cls = cls->parent)
-    {
-        std::snprintf(buf, sizeof(buf), "DAV diag: cpPlayerSystem chain <- %s (funcs=%u statics=%u)",
-                      cls->name.ToString() != nullptr ? cls->name.ToString() : "?", (unsigned)cls->funcs.size,
-                      (unsigned)cls->staticFuncs.size);
-        g_sdk->logger->Info(g_plugin_handle, buf);
-        for (uint32_t i = 0; i < cls->funcs.size; ++i)
-        {
-            auto* f = cls->funcs.entries[i];
-            const char* sn = (f != nullptr && f->shortName.ToString() != nullptr) ? f->shortName.ToString() : nullptr;
-            if (sn == nullptr)
-                continue;
-            if (strstr(sn, "Player") == nullptr && strstr(sn, "GameObject") == nullptr)
-                continue;
-            std::snprintf(buf, sizeof(buf), "DAV diag:   %s::%s params=%u",
-                          cls->name.ToString() != nullptr ? cls->name.ToString() : "?", sn,
-                          (unsigned)f->params.size);
-            g_sdk->logger->Info(g_plugin_handle, buf);
-        }
-    }
-    // 3) QueueEvent: found via which chain, full signature.
-    for (auto* start : {rtti->GetClass("PlayerPuppet"), ps})
-    {
-        if (start == nullptr)
-            continue;
-        RED4ext::CBaseFunction* qe = start->GetFunction("QueueEvent");
-        if (qe == nullptr)
-        {
-            std::snprintf(buf, sizeof(buf), "DAV diag: QueueEvent NOT on chain of %s",
-                          start->name.ToString() != nullptr ? start->name.ToString() : "?");
-            g_sdk->logger->Info(g_plugin_handle, buf);
-            continue;
-        }
-        int used = std::snprintf(buf, sizeof(buf), "DAV diag: QueueEvent via %s params=%u [",
-                                 start->name.ToString() != nullptr ? start->name.ToString() : "?",
-                                 (unsigned)qe->params.size);
-        for (uint32_t i = 0; i < qe->params.size && used > 0 && used < 200; ++i)
-            used += std::snprintf(buf + used, sizeof(buf) - used, "%s%s", i ? "," : "",
-                                  tn(qe->params.entries[i] != nullptr ? qe->params.entries[i]->type : nullptr));
-        if (used > 0)
-            std::snprintf(buf + used, sizeof(buf) - used, "] ret=%s", tn(qe->returnType != nullptr ? qe->returnType->type : nullptr));
-        g_sdk->logger->Info(g_plugin_handle, buf);
-    }
-}
-
 // Resolve any entity by id hash (FindEntityByID is the proven DLL-side lookup used for the
 // vehicle since the beginning).
-static void QueueDavSound(const char* aEventName)
+// aClassName: RTTI class to instantiate (gameActionEvent for the sound layer and the threshold
+// monitor; the monitor relay lives in the MOD's REDscript).
+// aTtl: timeToLive. Unknown actions ignore it, so the height monitor smuggles the measured height
+// in this float - the Lua side reads event.timeToLive back (see OnDavThresholdEvent).
+static void QueueDavEvent(const char* aClassName, const char* aEventName, float aTtl = 1.5f)
 {
     const char* fail = nullptr;
     auto* rtti = RED4ext::CRTTISystem::Get();
@@ -3105,7 +3080,6 @@ static void QueueDavSound(const char* aEventName)
             RED4ext::Handle<RED4ext::IScriptable> puppet_out{};
             if (SafeExecute(ps, get_player, &puppet_out, &no_args))
                 player = puppet_out.instance;
-            DavLogStep(player != nullptr ? "DAV snd step: GetPlayer ok" : "DAV snd step: GetPlayer null");
         }
     }
     if (player == nullptr)
@@ -3118,21 +3092,13 @@ static void QueueDavSound(const char* aEventName)
             queue_event = player_cls->GetFunction("QueueEvent");
         if (queue_event == nullptr)
             fail = "QueueEvent missing on puppet";
-        else
-        {
-            char buf[128];
-            auto* pt = player->GetType();
-            std::snprintf(buf, sizeof(buf), "DAV snd step: QueueEvent resolved (puppet=%s)",
-                          (pt != nullptr && pt->GetName().ToString() != nullptr) ? pt->GetName().ToString() : "?");
-            DavLogStep(buf);
-        }
     }
     // Lua's ActionEvent.new() works because REDscript strips the package prefix: the RTTI full
     // name of that class is gameActionEvent (runtime dump confirms eventAction@0x50,
     // internalEvent@0x58, size=104). A bare "ActionEvent" does not exist in RTTI.
-    auto* evt_cls = (fail == nullptr && rtti != nullptr) ? rtti->GetClass("gameActionEvent") : nullptr;
+    auto* evt_cls = (fail == nullptr && rtti != nullptr) ? rtti->GetClass(aClassName) : nullptr;
     if (fail == nullptr && evt_cls == nullptr)
-        fail = "gameActionEvent class missing";
+        fail = "event class missing";
     RED4ext::Handle<RED4ext::IScriptable> evt_guard(
         (fail == nullptr) ? evt_cls->CreateInstance<RED4ext::IScriptable*>(true) : nullptr);
     if (fail == nullptr && !evt_guard.instance)
@@ -3142,7 +3108,7 @@ static void QueueDavSound(const char* aEventName)
         if (g_sdk)
         {
             char buf[96];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavSound fail: %s (%s)", fail, aEventName);
+            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavEvent fail: %s (%s/%s)", fail, aClassName, aEventName);
             g_sdk->logger->Info(g_plugin_handle, buf);
         }
         return;
@@ -3169,14 +3135,16 @@ static void QueueDavSound(const char* aEventName)
         if (g_sdk)
         {
             char buf[96];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavSound fail: evt props missing (%s)", aEventName);
+            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavEvent fail: evt props missing (%s)", aEventName);
             g_sdk->logger->Info(g_plugin_handle, buf);
         }
         return;
     }
-    ttl_prop->SetValue<float>(evt, 1.5f); // fade window, same value Lua used
+    ttl_prop->SetValue<float>(evt, aTtl); // fade window (or the payload the height monitor sends)
     act_prop->SetValue<RED4ext::CName>(evt, RED4ext::CName(RED4ext::FNV1a64(aEventName)));
-    DavLogStep("DAV snd step: evt created");
+    // Optional 'key' field (custom event classes can carry the name in their own property).
+    if (auto* key_prop = find_prop(evt_cls, "key"); key_prop != nullptr)
+        key_prop->SetValue<RED4ext::CName>(evt, RED4ext::CName(RED4ext::FNV1a64(aEventName)));
     // Build every declared parameter slot, not just the first: QueueEvent may take extra
     // parameters (name/sticky style) and the VM reads whatever the stack holds for missing
     // ones - the leading suspect for the crash that survives the handle-slot fix. Slot 0 gets
@@ -3186,7 +3154,6 @@ static void QueueDavSound(const char* aEventName)
     // ref controller). Passing the address of a bare void* slot made the VM read 8 bytes of
     // adjacent stack as the ref controller - the crash that survived every earlier fix.
     std::vector<std::vector<uint8_t>> defaults;
-    static bool s_qe_sig_logged = false;
     for (uint32_t i = 0; i < queue_event->params.size; ++i)
     {
         if (i == 0)
@@ -3206,38 +3173,266 @@ static void QueueDavSound(const char* aEventName)
         defaults.emplace_back(sz + 8, 0);
         args.emplace_back(nullptr, defaults.back().data());
     }
-    if (!s_qe_sig_logged && g_sdk != nullptr)
-    {
-        s_qe_sig_logged = true;
-        char buf[192];
-        int used = std::snprintf(buf, sizeof(buf), "DAV dbg: QueueEvent params=%u [", (unsigned)queue_event->params.size);
-        for (uint32_t i = 0; i < queue_event->params.size && used > 0 && used < 150; ++i)
-        {
-            auto* prop = queue_event->params.entries[i];
-            auto* ptype = (prop != nullptr) ? prop->type : nullptr;
-            const char* tn = (ptype != nullptr && ptype->GetName().ToString() != nullptr) ? ptype->GetName().ToString() : "?";
-            used += std::snprintf(buf + used, sizeof(buf) - used, "%s%s", (i == 0 ? "" : ","), tn);
-        }
-        if (used > 0)
-            std::snprintf(buf + used, sizeof(buf) - used, "]");
-        g_sdk->logger->Info(g_plugin_handle, buf);
-    }
     // Ref-type arguments are passed as a pointer to the handle slot (a void* variable holding
     // the instance pointer), not as the instance pointer itself - passing the object directly
     // made the VM read its vftable as a handle, throw through SEH, and freeze the game.
-    DavLogStep("DAV snd step: calling QueueEvent");
     if (!SafeExecute(player, queue_event, nullptr, &args))
     {
         if (g_sdk)
         {
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavSound fail: QueueEvent threw exc=0x%08X (%s)",
+            std::snprintf(buf, sizeof(buf), "DAV dbg: QueueDavEvent fail: QueueEvent threw exc=0x%08X (%s)",
                           g_last_exception_code.load(std::memory_order_relaxed), aEventName);
             g_sdk->logger->Info(g_plugin_handle, buf);
         }
     }
-    else
-        DavLogStep("DAV snd step: QueueEvent ok");
+}
+
+static void QueueDavSound(const char* aEventName)
+{
+    QueueDavEvent("gameActionEvent", aEventName);
+}
+
+// ---- Threshold monitor (Phase 5) ----
+// Lua pre-arms the thresholds and a per-situation enable mask (1=height, 2=player distance,
+// 4=entry area). The monitor rides the frame clock on the game thread: height comes from the
+// same ground raycast the hover uses, the player position from one cheap VM call per frame.
+// A crossing is announced as a plain gameActionEvent (eventAction = dav_evt_*) queued on the
+// puppet through the proven QueueDavEvent path; the MOD's REDscript relay cb forwards it to the
+// native callback system ('DAV/Monitor') where the CET listener lives - Lua cannot hook entity
+// cbs, and DLL-created custom event classes never reach a cb (registration lives in 'new').
+static std::atomic<float> g_mon_height_thr{0.0f};
+static std::atomic<float> g_mon_dist_thr{0.0f};
+static std::atomic<float> g_mon_entry_radius{0.0f};
+static std::atomic<float> g_mon_keepalive{1.0f};
+static std::atomic<int32_t> g_mon_mask{0};
+static std::atomic<float> g_mon_entry_ox{0.0f};
+static std::atomic<float> g_mon_entry_oy{0.0f};
+static std::atomic<float> g_mon_entry_oz{0.0f};
+// Landing VFX slot: while the AV is inside the warning zone the DLL writes the slot's local
+// position itself (Lua used to track the height with an adaptive poll).
+static std::atomic<float> g_vfx_enabled{0.0f};
+
+void SetThresholds(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    float height_thr = 0.0f, dist_thr = 0.0f, entry_radius = 0.0f, keepalive = 1.0f;
+    int32_t mask = 0;
+    RED4ext::Vector4 entry_off{};
+    RED4ext::GetParameter(aFrame, &height_thr);
+    RED4ext::GetParameter(aFrame, &dist_thr);
+    RED4ext::GetParameter(aFrame, &entry_radius);
+    RED4ext::GetParameter(aFrame, &keepalive);
+    RED4ext::GetParameter(aFrame, &mask);
+    RED4ext::GetParameter(aFrame, &entry_off);
+    aFrame->code++;
+    g_mon_height_thr.store(height_thr, std::memory_order_relaxed);
+    g_mon_dist_thr.store(dist_thr, std::memory_order_relaxed);
+    g_mon_entry_radius.store(entry_radius, std::memory_order_relaxed);
+    g_mon_keepalive.store(keepalive, std::memory_order_relaxed);
+    g_mon_entry_ox.store(entry_off.X, std::memory_order_relaxed);
+    g_mon_entry_oy.store(entry_off.Y, std::memory_order_relaxed);
+    g_mon_entry_oz.store(entry_off.Z, std::memory_order_relaxed);
+    // The mask goes last: it arms the monitor, everything it reads is already in place.
+    g_mon_mask.store(mask, std::memory_order_relaxed);
+    *aOut = 1.0f;
+}
+
+void SetLandingVFX(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4)
+{
+    RED4EXT_UNUSED_PARAMETER(aContext);
+    RED4EXT_UNUSED_PARAMETER(a4);
+    float enabled = 0.0f;
+    RED4ext::Vector4 offset{};
+    RED4ext::GetParameter(aFrame, &enabled);
+    RED4ext::GetParameter(aFrame, &offset);
+    aFrame->code++;
+    g_vfx_enabled.store(enabled, std::memory_order_relaxed);
+    *aOut = 1.0f;
+}
+
+static bool SafePeekBytes(void* aAddr, void* aDst, size_t aLen)
+{
+    __try
+    {
+        std::memcpy(aDst, aAddr, aLen);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Borrowed puppet for one frame; the same proven path QueueDavSound uses.
+static RED4ext::IScriptable* ResolvePuppet()
+{
+    auto* rtti = RED4ext::CRTTISystem::Get();
+    auto* ps_type = (rtti != nullptr) ? rtti->GetClass("cpPlayerSystem") : nullptr;
+    RED4ext::ScriptGameInstance gi;
+    if (ps_type == nullptr || gi.instance == nullptr)
+        return nullptr;
+    RED4ext::IScriptable* ps = SafeGetSystem(gi.instance, ps_type);
+    if (ps == nullptr || ps->GetType() == nullptr)
+        return nullptr;
+    auto* get_player = ps->GetType()->GetFunction("GetPlayer");
+    if (get_player == nullptr)
+        return nullptr;
+    RED4ext::StackArgs_t no_args;
+    RED4ext::Handle<RED4ext::IScriptable> out{};
+    if (!SafeExecute(ps, get_player, &out, &no_args))
+        return nullptr;
+    return out.instance; // the game owns the puppet; the pointer outlives this frame
+}
+
+static bool PuppetWorldPos(RED4ext::IScriptable* aPuppet, RED4ext::Vector4* aPos)
+{
+    auto* t = aPuppet->GetType();
+    if (t == nullptr)
+        return false;
+    auto* fn = t->GetFunction("GetWorldPosition");
+    if (fn == nullptr)
+        return false;
+    RED4ext::StackArgs_t no_args;
+    return SafeExecute(aPuppet, fn, aPos, &no_args);
+}
+
+// v' = v + w*(2 q.v) + q x (2 q.v) - rotate a local offset into world space.
+static void RotateByQuat(float qw, float qx, float qy, float qz, float vx, float vy, float vz,
+                         float* ox, float* oy, float* oz)
+{
+    const float tx = 2.0f * (qy * vz - qz * vy);
+    const float ty = 2.0f * (qz * vx - qx * vz);
+    const float tz = 2.0f * (qx * vy - qy * vx);
+    *ox = vx + qw * tx + (qy * tz - qz * ty);
+    *oy = vy + qw * ty + (qz * tx - qx * tz);
+    *oz = vz + qw * tz + (qx * ty - qy * tx);
+}
+
+// Component lookup by name through the entity's component storage - the same SEH-guarded memory
+// walk the thruster resolver uses (CET refuses to pass component refs across the boundary).
+static void MonitorTick(float aDt)
+{
+    const int32_t mask = g_mon_mask.load(std::memory_order_relaxed);
+    static int s_height_state = 0; // -1 inside the warning zone, +1 outside, 0 unknown
+    static int s_dist_state = 0;   // -1 near, +1 far
+    static int s_entry_state = 0;  // +1 in, -1 out
+    static float s_keepalive_accum = 0.0f;
+
+    if (mask == 0)
+    {
+        s_height_state = 0;
+        s_dist_state = 0;
+        s_entry_state = 0;
+        s_keepalive_accum = 0.0f;
+        return;
+    }
+    if (g_fly_vehicle.instance == nullptr || g_fly_vehicle->physicsData == nullptr)
+        return;
+    auto* pd = g_fly_vehicle->physicsData;
+    const float avx = pd->worldPosition.X;
+    const float avy = pd->worldPosition.Y;
+    const float avz = pd->worldPosition.Z;
+
+    if (mask & 1)
+    {
+        // Raycast every frame: the VFX tick rides on this measurement, so the ray rate sets
+        // the smoothest Lua update the DLL can feed Lua.
+        float gz = 0.0f;
+        float height = -1.0f;
+        const bool ray_ok = RaycastGroundZ(avx, avy, avz + g_query_offset.load(std::memory_order_relaxed),
+                                           g_query_distance.load(std::memory_order_relaxed), &gz);
+        if (ray_ok)
+            height = avz - gz;
+        if (height >= 0.0f)
+        {
+            const float thr = g_mon_height_thr.load(std::memory_order_relaxed);
+            const int prev = s_height_state;
+            if (height < thr - 0.5f)
+                s_height_state = -1;
+            else if (height > thr + 0.5f)
+                s_height_state = 1;
+            if (s_height_state != prev)
+            {
+                // The crossing carries the measured height in timeToLive (see QueueDavEvent).
+                QueueDavEvent("gameActionEvent",
+                              s_height_state == -1 ? "dav_evt_height_low" : "dav_evt_height_high",
+                              height);
+            }
+            // The VFX slot position lives in Lua (it has a proven component handle there).
+            // While inside the warning zone the DLL re-fires a tick every frame that carries
+            // the fresh height in timeToLive, so Lua re-projects the VFX without polling.
+            if (s_height_state == -1 && g_vfx_enabled.load(std::memory_order_relaxed) != 0.0f)
+                QueueDavEvent("gameActionEvent", "dav_evt_height_tick", height);
+        }
+    }
+
+    if (mask & 6)
+    {
+        RED4ext::IScriptable* puppet = ResolvePuppet();
+        if (puppet == nullptr)
+            return;
+        RED4ext::Vector4 ppos{};
+        if (!PuppetWorldPos(puppet, &ppos))
+            return;
+        if (mask & 2)
+        {
+            const float dx = ppos.X - avx, dy = ppos.Y - avy, dz = ppos.Z - avz;
+            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float thr = g_mon_dist_thr.load(std::memory_order_relaxed);
+            const int prev = s_dist_state;
+            if (dist > thr + 2.0f)
+                s_dist_state = 1;
+            else if (dist < thr - 2.0f)
+                s_dist_state = -1;
+            if (s_dist_state != prev)
+                QueueDavEvent("gameActionEvent", s_dist_state == 1 ? "dav_evt_dist_far" : "dav_evt_dist_near");
+        }
+        if (mask & 4)
+        {
+            // The entry point is a local-space offset by the door; rotate it by the entity
+            // quaternion (same source the idle regulator trusts). No quaternion means the
+            // vehicle center - the radius still keeps the area usable.
+            float ox = g_mon_entry_ox.load(std::memory_order_relaxed);
+            float oy = g_mon_entry_oy.load(std::memory_order_relaxed);
+            float oz = g_mon_entry_oz.load(std::memory_order_relaxed);
+            const int32_t att_off = g_att_offset.load(std::memory_order_relaxed);
+            if (att_off >= 0)
+            {
+                struct { float i, j, k, r; } q{0.0f, 0.0f, 0.0f, 1.0f};
+                if (SafePeekBytes(reinterpret_cast<uint8_t*>(g_fly_vehicle.instance) + att_off, &q, sizeof(q)))
+                {
+                    const float n2 = q.i * q.i + q.j * q.j + q.k * q.k + q.r * q.r;
+                    if (n2 > 0.5f && n2 < 1.5f)
+                        RotateByQuat(q.r, q.i, q.j, q.k, ox, oy, oz, &ox, &oy, &oz);
+                }
+            }
+            const float dx = ppos.X - (avx + ox), dy = ppos.Y - (avy + oy), dz = ppos.Z - (avz + oz);
+            const float d2 = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float r = g_mon_entry_radius.load(std::memory_order_relaxed);
+            const int prev = s_entry_state;
+            if (d2 <= r - 0.5f)
+                s_entry_state = 1;
+            else if (d2 >= r + 0.5f)
+                s_entry_state = -1;
+            if (s_entry_state != prev)
+            {
+                s_keepalive_accum = 0.0f;
+                QueueDavEvent("gameActionEvent",
+                              s_entry_state == 1 ? "dav_evt_entry_in" : "dav_evt_entry_out");
+            }
+            if (s_entry_state == 1)
+            {
+                s_keepalive_accum += aDt;
+                if (s_keepalive_accum >= g_mon_keepalive.load(std::memory_order_relaxed))
+                {
+                    s_keepalive_accum = 0.0f;
+                    QueueDavEvent("gameActionEvent", "dav_evt_entry_in"); // keep-alive re-fire (HUD choice re-show)
+                }
+            }
+        }
+    }
 }
 
 static void DispatchSndEdge(int32_t aCode)
@@ -3500,9 +3695,7 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
                       (unsigned long)GetCurrentThreadId(), (unsigned long)g_hook_thread_id.load());
         g_sdk->logger->Info(g_plugin_handle, buf);
     }
-    if (n == 2)
-        DumpSoundRTTIOnce();
-    if ((n % 600) == 300 && g_sdk)
+        if ((n % 600) == 300 && g_sdk)
     {
         // Heartbeat proving OnUpdate (and therefore ThrusterTick/SoundEdgeTick) still runs; also
         // samples the physics state so a game-side disable becomes visible in the log.
@@ -3610,6 +3803,9 @@ static bool RED4EXT_CALL DavGameState_OnUpdate(RED4ext::CGameApplication* aApp)
             dt = 0.1f;
         ThrusterTick(dt);
         SoundEdgeTick(dt);
+        // Threshold monitor: height / player distance / entry-area edges announced as events.
+        if (g_mon_mask.load(std::memory_order_relaxed) != 0)
+            MonitorTick(dt);
     }
     // MUST return false: RED4ext treats a state's OnUpdate returning true as "finished" and stops
     // calling it next frame. Returning true here once made the whole frame clock (thruster swing,
@@ -3762,6 +3958,8 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::PluginHandle aHandle, RED4ext::
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterUnsetPhysicsState);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterIsOnGround);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterGetNativeTickCount);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetThresholds);
+        RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetLandingVFX);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightFlags);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightControl);
         RED4ext::CRTTISystem::Get()->AddPostRegisterCallback(PostRegisterSetFlightParams);
